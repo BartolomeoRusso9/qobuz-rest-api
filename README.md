@@ -1,1 +1,504 @@
 # qobuz-api
+
+A local REST API on `http://localhost:8000` that exposes Qobuz functions for use by any program (e.g. Spotiflac, Python scripts, etc.)
+
+> [!IMPORTANT]
+> Music piracy is illegal in most countries. This project is intended for use with a valid Qobuz subscription for personal/educational purposes (e.g. in your homelab). Use responsibly.
+
+---
+
+## Setup
+
+Run `pip install -r requirements.txt`, then configure your `.env` file:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Description |
+|---|---|
+| `QOBUZ_APP_ID` | Qobuz App ID → [AppID Tool](https://github.com/QobuzDL/Qobuz-AppID-Secret-Tool) |
+| `QOBUZ_SECRET` | Qobuz Secret → same tool |
+| `QOBUZ_TOKEN` | User token → localStorage of [play.qobuz.com](https://play.qobuz.com), key `localuser.token` |
+
+Start the server with:
+
+```bash
+python main.py
+```
+
+Or directly with uvicorn:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Interactive docs available at **http://localhost:8000/docs**
+
+---
+
+## API Schema
+
+### `GET /search/`
+
+#### Params
+
+- `q`: `str` (required) — search query
+- `type`: `str` (optional, default `tracks`) — `tracks`, `albums`, `artists`
+- `limit`: `int` (optional, default `25`) — number of results
+
+#### Response
+
+`200 OK`
+
+```json
+{
+  "query": "Francesco Cavestri",
+  "type": "albums",
+  "data": {
+    "limit": 25,
+    "offset": 0,
+    "totalNumberOfItems": 11,
+    "items": [
+      {
+        "id": "em5pzj2fxalfl",
+        "title": "Noè",
+        "release_date_original": "2026-05-29",
+        "duration": 2330,
+        "tracks_count": 10,
+        "hires_streamable": true,
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 48,
+        "artist": {
+          "id": 12951852,
+          "name": "Francesco Cavestri"
+        }
+      }
+    ]
+  }
+}
+```
+
+---
+
+### `GET /track/{track_id}`
+
+Returns the full metadata of a track.
+
+```bash
+curl -X 'GET' \
+  'http://localhost:8000/track/420232043' \
+  -H 'accept: application/json'
+```
+
+#### Params
+
+- `track_id`: `str` (required) — Qobuz track ID
+
+#### Response
+
+`200 OK`
+
+```json
+{
+  "id": 420232043,
+  "title": "Omen Of A Sea",
+  "isrc": "ITUM72600479",
+  "duration": 147,
+  "track_number": 1,
+  "media_number": 1,
+  "version": null,
+  "parental_warning": false,
+  "hires": true,
+  "hires_streamable": true,
+  "maximum_bit_depth": 24,
+  "maximum_sampling_rate": 48,
+  "maximum_channel_count": 2,
+  "streamable": true,
+  "downloadable": true,
+  "purchasable": true,
+  "release_date_original": "2026-05-29",
+  "copyright": "℗ 2026 Universal Music Italia Srl",
+  "performers": "Francesco Cavestri, MainArtist, Composer - Luca Mattioni, ComputermusicProgrammer, Producer - Giuseppe Salvadori, ComputermusicProgrammer, MixingEngineer, MasteringEngineer",
+  "audio_info": {
+    "replaygain_track_gain": -5.43,
+    "replaygain_track_peak": 0.922699
+  },
+  "performer": {
+    "id": 12951852,
+    "name": "Francesco Cavestri"
+  },
+  "composer": {
+    "id": 12951852,
+    "name": "Francesco Cavestri"
+  },
+  "album": {
+    "id": "em5pzj2fxalfl",
+    "title": "Noè",
+    "qobuz_id": 420232042,
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 48,
+    "hires_streamable": true,
+    "image": {
+      "small": "https://static.qobuz.com/images/covers/fl/al/em5pzj2fxalfl_230.jpg",
+      "thumbnail": "https://static.qobuz.com/images/covers/fl/al/em5pzj2fxalfl_50.jpg",
+      "large": "https://static.qobuz.com/images/covers/fl/al/em5pzj2fxalfl_600.jpg",
+      "back": null
+    },
+    "artist": {
+      "id": 12951852,
+      "name": "Francesco Cavestri"
+    },
+    "label": {
+      "id": 190126,
+      "name": "Universal Music Italia srL."
+    },
+    "genre": {
+      "id": 80,
+      "name": "Jazz",
+      "slug": "jazz"
+    }
+  }
+}
+```
+
+---
+
+### `GET /album/{album_id}`
+
+Returns album metadata and full track listing.
+
+```bash
+curl -X 'GET' \
+  'http://localhost:8000/album/em5pzj2fxalfl' \
+  -H 'accept: application/json'
+```
+
+#### Params
+
+- `album_id`: `str` (required) — Qobuz album ID
+
+#### Response
+
+`200 OK`
+
+```json
+{
+  "id": "em5pzj2fxalfl",
+  "title": "Noè",
+  "qobuz_id": 420232042,
+  "upc": "0600574182104",
+  "duration": 2330,
+  "tracks_count": 10,
+  "media_count": 1,
+  "release_date_original": "2026-05-29",
+  "hires": true,
+  "hires_streamable": true,
+  "maximum_bit_depth": 24,
+  "maximum_sampling_rate": 48,
+  "maximum_channel_count": 2,
+  "maximum_technical_specifications": "24 bits / 48.0 kHz - Stereo",
+  "streamable": true,
+  "downloadable": true,
+  "purchasable": true,
+  "parental_warning": false,
+  "copyright": "© 2026 Universal Music Italia Srl ℗ 2026 Universal Music Italia Srl",
+  "image": {
+    "small": "https://static.qobuz.com/images/covers/fl/al/em5pzj2fxalfl_230.jpg",
+    "thumbnail": "https://static.qobuz.com/images/covers/fl/al/em5pzj2fxalfl_50.jpg",
+    "large": "https://static.qobuz.com/images/covers/fl/al/em5pzj2fxalfl_600.jpg",
+    "back": null
+  },
+  "artist": {
+    "id": 12951852,
+    "name": "Francesco Cavestri",
+    "slug": "francesco-cavestri"
+  },
+  "artists": [
+    { "id": 12951852, "name": "Francesco Cavestri", "roles": ["main-artist"] }
+  ],
+  "label": {
+    "id": 190126,
+    "name": "Universal Music Italia srL.",
+    "slug": "universalmusicitaliasrl"
+  },
+  "genre": {
+    "id": 80,
+    "name": "Jazz",
+    "slug": "jazz",
+    "color": "#0070ef"
+  },
+  "awards": [
+    {
+      "name": "Album della settimana Qobuz",
+      "publication_name": "Qobuz",
+      "awarded_at": 1780005600
+    }
+  ],
+  "tracks": {
+    "offset": 0,
+    "limit": 500,
+    "total": 10,
+    "items": [
+      {
+        "id": 420232043,
+        "title": "Omen Of A Sea",
+        "track_number": 1,
+        "duration": 147,
+        "isrc": "ITUM72600479",
+        "hires": true,
+        "hires_streamable": true,
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 48,
+        "audio_info": {
+          "replaygain_track_gain": -5.43,
+          "replaygain_track_peak": 0.922699
+        }
+      },
+      {
+        "id": 420232044,
+        "title": "Noè",
+        "track_number": 2,
+        "duration": 337,
+        "isrc": "ITUM72600480",
+        "hires": true,
+        "hires_streamable": true,
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 48,
+        "audio_info": {
+          "replaygain_track_gain": -4.14,
+          "replaygain_track_peak": 0.942474
+        }
+      }
+    ]
+  }
+}
+```
+
+> [!NOTE]
+> `tracks.items` is truncated above. The full response includes all tracks in the album.
+
+---
+
+### `GET /artist/{artist_id}`
+
+Returns artist data and their album catalogue.
+
+```bash
+curl -X 'GET' \
+  'http://localhost:8000/artist/12951852?limit=20' \
+  -H 'accept: application/json'
+```
+
+#### Params
+
+- `artist_id`: `str` (required) — Qobuz artist ID
+- `limit`: `int` (optional, default `20`, min `1`, max `100`) — number of albums to return
+
+#### Response
+
+`200 OK`
+
+```json
+{
+  "id": 12951852,
+  "name": "Francesco Cavestri",
+  "slug": "francesco-cavestri",
+  "albums_count": 11,
+  "albums_as_primary_artist_count": 19,
+  "albums_as_primary_composer_count": 17,
+  "picture": null,
+  "image": {
+    "small": "https://static.qobuz.com/images/artists/covers/small/1f60a55e0ed77d46294e4fbc270f36ba.jpg",
+    "medium": "https://static.qobuz.com/images/artists/covers/medium/1f60a55e0ed77d46294e4fbc270f36ba.jpg",
+    "large": "https://static.qobuz.com/images/artists/covers/large/1f60a55e0ed77d46294e4fbc270f36ba.jpg"
+  },
+  "biography": {
+    "source": "Qobuz",
+    "language": "it",
+    "summary": "<p>Nato nel 2003, <strong>Francesco Cavestri</strong> è un pianista, compositore..."
+  },
+  "albums": {
+    "total": 11,
+    "offset": 0,
+    "limit": 20,
+    "items": [
+      {
+        "id": "em5pzj2fxalfl",
+        "title": "Noè",
+        "release_date_original": "2026-05-29",
+        "duration": 2330,
+        "tracks_count": 10,
+        "hires_streamable": true,
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 48,
+        "genre": { "id": 80, "name": "Jazz" },
+        "label": { "id": 190126, "name": "Universal Music Italia srL." },
+        "image": {
+          "thumbnail": "https://static.qobuz.com/images/covers/fl/al/em5pzj2fxalfl_50.jpg",
+          "large": "https://static.qobuz.com/images/covers/fl/al/em5pzj2fxalfl_600.jpg"
+        }
+      },
+      {
+        "id": "bp2sbqf7r7jnb",
+        "title": "IKI - Bellezza Ispiratrice",
+        "release_date_original": "2024-01-19",
+        "duration": 1859,
+        "tracks_count": 6,
+        "hires_streamable": true,
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 44.1,
+        "genre": { "id": 80, "name": "Jazz" },
+        "label": { "id": 190126, "name": "Universal Music Italia srL." }
+      }
+    ]
+  }
+}
+```
+
+> [!NOTE]
+> `albums.items` is truncated above. The full response includes all albums up to the requested `limit`.
+
+---
+
+### `GET /download-url/{track_id}`
+
+Returns a signed URL ready for download. Used by Spotiflac and similar tools.
+
+#### Params
+
+- `track_id`: `str` (required) — Qobuz track ID
+- `quality`: `str` (optional, default `flac`) — see table below
+
+| Value | Format |
+|---|---|
+| `mp3` | MP3 320kbps |
+| `flac` | FLAC 16-bit (CD) |
+| `hi24` | FLAC 24-bit ≤96kHz |
+| `hi96` | FLAC 24-bit >96kHz (Hi-Res) |
+
+#### Response
+
+`200 OK`
+
+```json
+{
+  "track_id": "420232043",
+  "quality": "hi24",
+  "mime_type": "audio/flac",
+  "url": "https://streaming.qobuz.com/file?uid=...&secret=...&sig=...&expire=1780005600"
+}
+```
+
+> [!NOTE]
+> The signed URL is time-limited. Pass it directly to `ffmpeg`, `httpx`, or any HTTP client — do not store it for later use.
+
+---
+
+### `GET /stream/{track_id}`
+
+Proxies the audio stream directly. Useful for media players that support HTTP sources.
+
+#### Params
+
+- `track_id`: `str` (required) — Qobuz track ID
+- `quality`: `str` (optional, default `flac`) — same values as `/download-url/`
+
+#### Response
+
+Binary audio stream with appropriate `Content-Type` header.
+
+---
+
+### `POST /download`
+
+Downloads a track to disk.
+
+#### Body
+
+```json
+{
+  "track_id": "420232043",
+  "quality": "hi24",
+  "output_dir": "./downloads"
+}
+```
+
+#### Response
+
+`200 OK`
+
+```json
+{
+  "status": "ok",
+  "path": "./downloads/Francesco Cavestri - Omen Of A Sea.flac"
+}
+```
+
+---
+
+### `POST /download-album/{album_id}`
+
+Downloads a full album to disk.
+
+#### Params
+
+- `album_id`: `str` (required) — Qobuz album ID
+- `quality`: `str` (optional, default `flac`)
+- `output_dir`: `str` (optional, default `./downloads`)
+
+#### Response
+
+`200 OK`
+
+```json
+{
+  "status": "ok",
+  "downloaded": 10,
+  "failed": 0,
+  "path": "./downloads/Francesco Cavestri - Noè/"
+}
+```
+
+---
+
+## Usage Examples
+
+### Python
+
+```python
+import requests
+
+BASE = "http://localhost:8000"
+
+# Search for an album
+results = requests.get(f"{BASE}/search", params={"q": "Francesco Cavestri", "type": "albums"}).json()
+
+# Get a signed download URL
+url_info = requests.get(f"{BASE}/download-url/420232043", params={"quality": "hi24"}).json()
+print(url_info["url"])  # pass directly to ffmpeg or httpx
+```
+
+### curl
+
+```bash
+# Search
+curl "http://localhost:8000/search?q=Francesco+Cavestri&type=albums"
+
+# Track metadata
+curl "http://localhost:8000/track/420232043"
+
+# Album metadata
+curl "http://localhost:8000/album/em5pzj2fxalfl"
+
+# Artist with albums
+curl "http://localhost:8000/artist/12951852?limit=20"
+
+# Download URL
+curl "http://localhost:8000/download-url/420232043?quality=hi24"
+
+# Download to disk
+curl -X POST http://localhost:8000/download \
+  -H "Content-Type: application/json" \
+  -d '{"track_id":"420232043","quality":"hi24","output_dir":"./music"}'
+```
