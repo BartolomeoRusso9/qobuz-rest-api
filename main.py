@@ -46,8 +46,8 @@ QUALITY_MAP = {
     "hi96": 27,   # FLAC 24-bit >96kHz (Hi-Res)
 }
 
-# Semaphore: max 3 concurrent downloads at any time
-DOWNLOAD_SEM = asyncio.Semaphore(3)
+# Semaphore: max 2 concurrent downloads at any time
+DOWNLOAD_SEM = asyncio.Semaphore(2)
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 def sanitize_filename(name: str) -> str:
