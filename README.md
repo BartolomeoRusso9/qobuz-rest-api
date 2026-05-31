@@ -17,9 +17,12 @@ cp .env.example .env
 
 | Variable | Description |
 |---|---|
-| `QOBUZ_APP_ID` | Qobuz App ID → [AppID Tool](https://github.com/QobuzDL/Qobuz-AppID-Secret-Tool) |
-| `QOBUZ_SECRET` | Qobuz Secret → same tool |
+| `QOBUZ_APP_ID` | Qobuz App ID — if left empty, extracted automatically on startup |
+| `QOBUZ_SECRET` | Qobuz Secret — if left empty, extracted automatically on startup |
 | `QOBUZ_TOKEN` | User token → localStorage of [play.qobuz.com](https://play.qobuz.com), key `localuser.token` |
+
+> [!NOTE]
+> `QOBUZ_APP_ID` and `QOBUZ_SECRET` are optional. If missing, the server extracts them automatically from the Qobuz web player on startup and saves them to `.env` for future restarts.
 
 Start the server with:
 
@@ -39,13 +42,36 @@ Interactive docs available at **http://localhost:8000/docs**
 
 ## API Schema
 
-### `GET /search/`
+### `GET /`
+
+Returns server status and available endpoints.
+
+#### Response
+
+`200 OK`
+
+```json
+{
+  "status": "online",
+  "version": "1.0.0",
+  "docs": "http://localhost:8000/docs",
+  "endpoints": [
+    "/search", "/track/{id}", "/album/{id}",
+    "/artist/{id}", "/download-url/{track_id}",
+    "/stream/{track_id}", "/download", "/download-album/{album_id}"
+  ]
+}
+```
+
+---
+
+### `GET /search`
 
 #### Params
 
 - `q`: `str` (required) — search query
 - `type`: `str` (optional, default `tracks`) — `tracks`, `albums`, `artists`
-- `limit`: `int` (optional, default `25`) — number of results
+- `limit`: `int` (optional, default `10`, min `1`, max `50`) — number of results
 
 #### Response
 
@@ -54,11 +80,10 @@ Interactive docs available at **http://localhost:8000/docs**
 ```json
 {
   "query": "Francesco Cavestri",
-  "type": "albums",
-  "data": {
-    "limit": 25,
+  "albums": {
+    "limit": 10,
     "offset": 0,
-    "totalNumberOfItems": 11,
+    "total": 11,
     "items": [
       {
         "id": "em5pzj2fxalfl",
@@ -385,7 +410,11 @@ Returns a signed URL ready for download. Used by Spotiflac and similar tools.
 {
   "track_id": "420232043",
   "quality": "hi24",
+  "format_id": 7,
   "mime_type": "audio/flac",
+  "bit_depth": 24,
+  "sampling_rate": 48.0,
+  "file_size": 42831737,
   "url": "https://streaming.qobuz.com/file?uid=...&secret=...&sig=...&expire=1780005600"
 }
 ```
@@ -412,7 +441,7 @@ Binary audio stream with appropriate `Content-Type` header.
 
 ### `POST /download`
 
-Downloads a track to disk.
+Downloads a track to disk in the background. Returns immediately.
 
 #### Body
 
@@ -430,16 +459,22 @@ Downloads a track to disk.
 
 ```json
 {
-  "status": "ok",
-  "path": "./downloads/Francesco Cavestri - Omen Of A Sea.flac"
+  "status": "downloading",
+  "track_id": "420232043",
+  "filename": "Francesco Cavestri - Omen Of A Sea.flac",
+  "output": "./downloads/Francesco Cavestri - Omen Of A Sea.flac",
+  "quality": "hi24"
 }
 ```
+
+> [!NOTE]
+> The download runs in the background. The response is returned immediately — check the output path to verify completion.
 
 ---
 
 ### `POST /download-album/{album_id}`
 
-Downloads a full album to disk.
+Downloads all tracks from an album to disk in the background. Returns immediately.
 
 #### Params
 
@@ -453,12 +488,17 @@ Downloads a full album to disk.
 
 ```json
 {
-  "status": "ok",
-  "downloaded": 10,
-  "failed": 0,
-  "path": "./downloads/Francesco Cavestri - Noè/"
+  "status": "downloading",
+  "album": "Noè",
+  "artist": "Francesco Cavestri",
+  "tracks": 10,
+  "output_dir": "./downloads/Francesco Cavestri - Noè",
+  "quality": "hi24"
 }
 ```
+
+> [!NOTE]
+> All tracks download in the background concurrently. The response is returned immediately — check `output_dir` to monitor progress.
 
 ---
 
@@ -497,8 +537,11 @@ curl "http://localhost:8000/artist/12951852?limit=20"
 # Download URL
 curl "http://localhost:8000/download-url/420232043?quality=hi24"
 
-# Download to disk
+# Download track to disk
 curl -X POST http://localhost:8000/download \
   -H "Content-Type: application/json" \
   -d '{"track_id":"420232043","quality":"hi24","output_dir":"./music"}'
+
+# Download full album to disk
+curl -X POST "http://localhost:8000/download-album/em5pzj2fxalfl?quality=hi24&output_dir=./music"
 ```

@@ -9,33 +9,21 @@ import time
 import os
 import re
 import httpx
-from typing import Optional, Literal
+from contextlib import asynccontextmanager
+from typing import Literal
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 
 load_dotenv()
-
-app = FastAPI(
-    title="Qobuz Local API",
-    description="Local API to download music from Qobuz",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 QOBUZ_BASE = "https://www.qobuz.com/api.json/0.2"
 APP_ID     = os.getenv("QOBUZ_APP_ID", "")
 SECRET     = os.getenv("QOBUZ_SECRET", "")
-TOKEN      = os.getenv("QOBUZ_TOKEN", "")         # User token (from Qobuz localStorage)
+TOKEN      = os.getenv("QOBUZ_TOKEN", "")
 
 # Quality IDs
 QUALITY_MAP = {
@@ -50,6 +38,7 @@ async def auto_extract_keys():
     """
     Integrates the Qobuz-AppID-Secret-Tool logic to automatically extract
     App ID and Secret from the web player if they are missing in the .env file.
+    Extracted values are persisted to .env so they survive restarts.
     """
     global APP_ID, SECRET
     if APP_ID and SECRET:
@@ -73,14 +62,16 @@ async def auto_extract_keys():
                     match_id = re.search(r'app_id\s*:\s*["\']([^"\']+)["\']', js)
                     if match_id:
                         APP_ID = match_id.group(1)
-                        print(f"[+] App ID automatically extracted: {APP_ID}")
+                        set_key(".env", "QOBUZ_APP_ID", APP_ID)
+                        print(f"[+] App ID automatically extracted and saved: {APP_ID}")
 
                 # Extract SECRET (usually a 32-character hex hash associated with the player)
                 if not SECRET:
                     secrets = re.findall(r'["\']([a-f0-9]{32})["\']', js)
                     if secrets:
-                        SECRET = secrets[0]  # The first one is usually the correct seed
-                        print(f"[+] App Secret automatically extracted: {SECRET}")
+                        SECRET = secrets[0]
+                        set_key(".env", "QOBUZ_SECRET", SECRET)
+                        print(f"[+] App Secret automatically extracted and saved: {SECRET}")
 
                 # If both are found, stop the loop
                 if APP_ID and SECRET:
@@ -91,10 +82,26 @@ async def auto_extract_keys():
     except Exception as e:
         print(f"[-] Connection error during extraction: {e}")
 
-# Run the extraction procedure as soon as the server starts
-@app.on_event("startup")
-async def startup_event():
+# ─── Lifespan ──────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     await auto_extract_keys()
+    yield
+
+# ─── App ───────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Qobuz Local API",
+    description="Local API to download music from Qobuz",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ─── Authentication ────────────────────────────────────────────────────────
 async def get_token() -> str:
@@ -137,7 +144,8 @@ async def root():
         "docs": "http://localhost:8000/docs",
         "endpoints": [
             "/search", "/track/{id}", "/album/{id}",
-            "/artist/{id}", "/download-url/{track_id}", "/download"
+            "/artist/{id}", "/download-url/{track_id}",
+            "/stream/{track_id}", "/download", "/download-album/{album_id}",
         ]
     }
 
@@ -149,12 +157,11 @@ async def search(
     limit: int = Query(10, ge=1, le=50),
 ):
     """Searches for tracks, albums, or artists on Qobuz."""
-    data = await qobuz_get("catalog/search", {
-        "query":  q,
-        "type":   type,
-        "limit":  limit,
+    return await qobuz_get("catalog/search", {
+        "query": q,
+        "type":  type,
+        "limit": limit,
     })
-    return data
 
 # ─── Endpoint: Track Info ──────────────────────────────────────────────────
 @app.get("/track/{track_id}", tags=["metadata"])
@@ -195,10 +202,10 @@ async def get_download_url(
     sig, ts   = make_sig(track_id, format_id)
 
     data = await qobuz_get("track/getFileUrl", {
-        "track_id":   track_id,
-        "format_id":  format_id,
-        "intent":     "stream",
-        "request_ts": ts,
+        "track_id":    track_id,
+        "format_id":   format_id,
+        "intent":      "stream",
+        "request_ts":  ts,
         "request_sig": sig,
     })
 
@@ -267,7 +274,6 @@ async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks
         "filename": fname,
         "output":   out_path,
         "quality":  req.quality,
-        "url":      url_data["url"],
     }
 
 # ─── Endpoint: Full Album Download ─────────────────────────────────────────
@@ -289,18 +295,18 @@ async def download_album(
     album_dir   = os.path.join(output_dir, f"{artist_name} - {album_title}".replace("/", "-"))
     os.makedirs(album_dir, exist_ok=True)
 
-    jobs = []
     for track in tracks:
         tid = str(track["id"])
-        req = DownloadRequest(track_id=tid, quality=quality, output_dir=album_dir)
-        jobs.append(tid)
-        background_tasks.add_task(_download_single, req)
+        background_tasks.add_task(
+            _download_single,
+            DownloadRequest(track_id=tid, quality=quality, output_dir=album_dir)
+        )
 
     return {
         "status":     "downloading",
         "album":      album_title,
         "artist":     artist_name,
-        "tracks":     len(jobs),
+        "tracks":     len(tracks),
         "output_dir": album_dir,
         "quality":    quality,
     }
