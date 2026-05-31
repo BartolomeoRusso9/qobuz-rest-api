@@ -536,6 +536,41 @@ Downloads all tracks from an album to disk in the background. Returns immediatel
 
 ---
 
+### `GET /album-status/{album_id}`
+
+Returns the download progress for an album by reading `status.json` from disk.
+
+```bash
+curl "http://localhost:8000/album-status/em5pzj2fxalfl?output_dir=./music"
+```
+
+#### Params
+
+- `album_id`: `str` (required) — Qobuz album ID
+- `output_dir`: `str` (optional, default `./downloads`) — must match the path used in `/download-album`
+
+#### Response
+
+`200 OK`
+
+```json
+{
+  "album":   "Noè",
+  "artist":  "Francesco Cavestri",
+  "done":    7,
+  "pending": 2,
+  "errors":  1,
+  "tracks": {
+    "420232043": { "title": "Omen Of A Sea", "status": "done",  "file": "01 - Omen Of A Sea.flac" },
+    "420232044": { "title": "Noè",           "status": "error", "error": "403 Forbidden"           }
+  }
+}
+```
+
+`404 Not Found` if no `status.json` exists for that album (download not yet started).
+
+---
+
 ## Usage Examples
 
 ### Python
@@ -580,5 +615,5 @@ curl -X POST http://localhost:8000/download \
 curl -X POST "http://localhost:8000/download-album/em5pzj2fxalfl?quality=hi24&output_dir=./music"
 
 # Check album download progress
-cat "./music/Francesco Cavestri - Noè/status.json"
+curl "http://localhost:8000/album-status/em5pzj2fxalfl?output_dir=./music"
 ```

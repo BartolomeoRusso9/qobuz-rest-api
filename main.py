@@ -46,8 +46,11 @@ QUALITY_MAP = {
     "hi96": 27,   # FLAC 24-bit >96kHz (Hi-Res)
 }
 
-# Semaphore: max 2 concurrent downloads at any time
-DOWNLOAD_SEM = asyncio.Semaphore(2)
+# Semaphore: max 3 concurrent downloads at any time
+DOWNLOAD_SEM = asyncio.Semaphore(3)
+
+# Shared HTTP client — initialised in lifespan, reused across all requests
+http_client: httpx.AsyncClient | None = None
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 def sanitize_filename(name: str) -> str:
@@ -92,42 +95,44 @@ async def auto_extract_keys():
 
     logger.info("Missing App ID or Secret — starting automatic extraction from play.qobuz.com...")
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get("https://play.qobuz.com/login")
-            scripts = re.findall(r'src=["\'](/resources/[^"\']+\.js)["\']', r.text)
+        r = await http_client.get("https://play.qobuz.com/login")
+        scripts = re.findall(r'src=["\'](/resources/[^"\']+\.js)["\']', r.text)
 
-            for script_path in scripts:
-                js_url = f"https://play.qobuz.com{script_path}"
-                r_js   = await client.get(js_url)
-                js     = r_js.text
+        for script_path in scripts:
+            js_url = f"https://play.qobuz.com{script_path}"
+            r_js   = await http_client.get(js_url)
+            js     = r_js.text
 
-                if not APP_ID:
-                    match_id = re.search(r'app_id\s*:\s*["\']([^"\']+)["\']', js)
-                    if match_id:
-                        APP_ID = match_id.group(1)
-                        set_key(".env", "QOBUZ_APP_ID", APP_ID)
-                        logger.info(f"App ID extracted and saved: {APP_ID}")
+            if not APP_ID:
+                match_id = re.search(r'app_id\s*:\s*["\']([^"\']+)["\']', js)
+                if match_id:
+                    APP_ID = match_id.group(1)
+                    set_key(".env", "QOBUZ_APP_ID", APP_ID)
+                    logger.info(f"App ID extracted and saved: {APP_ID}")
 
-                if not SECRET:
-                    secrets = re.findall(r'["\']([a-f0-9]{32})["\']', js)
-                    if secrets:
-                        SECRET = secrets[0]
-                        set_key(".env", "QOBUZ_SECRET", SECRET)
-                        logger.info(f"App Secret extracted and saved: {SECRET}")
+            if not SECRET:
+                secrets = re.findall(r'["\']([a-f0-9]{32})["\']', js)
+                if secrets:
+                    SECRET = secrets[0]
+                    set_key(".env", "QOBUZ_SECRET", SECRET)
+                    logger.info(f"App Secret extracted and saved: {SECRET}")
 
-                if APP_ID and SECRET:
-                    break
+            if APP_ID and SECRET:
+                break
 
-            if not APP_ID or not SECRET:
-                logger.warning("Unable to automatically extract keys from JS files.")
+        if not APP_ID or not SECRET:
+            logger.warning("Unable to automatically extract keys from JS files.")
     except Exception as e:
         logger.error(f"Connection error during extraction: {e}")
 
 # ─── Lifespan ──────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(timeout=30)
     await auto_extract_keys()
     yield
+    await http_client.aclose()
 
 # ─── App ───────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -162,8 +167,7 @@ async def qobuz_get(endpoint: str, params: dict) -> dict:
         raise HTTPException(500, "App ID and Secret unavailable. Configure .env or check connection to Qobuz.")
     token = await get_token()
     params.update({"app_id": APP_ID, "user_auth_token": token})
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(f"{QOBUZ_BASE}/{endpoint}", params=params)
+    r = await http_client.get(f"{QOBUZ_BASE}/{endpoint}", params=params)
     data = r.json()
     if r.status_code != 200:
         raise HTTPException(r.status_code, data.get("message", "Qobuz Error"))
@@ -186,6 +190,7 @@ async def root():
             "/search", "/track/{id}", "/album/{id}",
             "/artist/{id}", "/download-url/{track_id}",
             "/stream/{track_id}", "/download", "/download-album/{album_id}",
+            "/album-status/{album_id}",
         ],
     }
 
@@ -270,10 +275,9 @@ async def stream_track(
     url      = url_data["url"]
 
     async def generate():
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("GET", url) as r:
-                async for chunk in r.aiter_bytes(chunk_size=65536):
-                    yield chunk
+        async with http_client.stream("GET", url, timeout=None) as r:
+            async for chunk in r.aiter_bytes(chunk_size=65536):
+                yield chunk
 
     mime = url_data.get("mime_type") or (
         "audio/mpeg" if quality == "mp3" else "audio/flac"
@@ -284,7 +288,9 @@ async def stream_track(
 @app.post("/download", tags=["download"])
 async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks):
     """Downloads a single track to disk in the specified path."""
-    url_data   = await get_download_url(req.track_id, req.quality)
+    # Fetch track info now so we can return the filename in the response immediately.
+    # The signed URL is intentionally NOT fetched here — it would expire while
+    # waiting to acquire the semaphore. It is fetched fresh inside do_download.
     track_info = await get_track(req.track_id)
 
     artist   = track_info.get("performer", {}).get("name", "Unknown Artist")
@@ -297,13 +303,14 @@ async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks
 
     async def do_download():
         async with DOWNLOAD_SEM:
+            # URL fetched here — always fresh when the semaphore slot opens
+            url_data = await get_download_url(req.track_id, req.quality)
             logger.info(f"[{req.track_id}] Starting: {fname}")
             try:
-                async with httpx.AsyncClient(timeout=None) as client:
-                    async with client.stream("GET", url_data["url"]) as r:
-                        with open(out_path, "wb") as f:
-                            async for chunk in r.aiter_bytes(65536):
-                                f.write(chunk)
+                async with http_client.stream("GET", url_data["url"], timeout=None) as r:
+                    with open(out_path, "wb") as f:
+                        async for chunk in r.aiter_bytes(65536):
+                            f.write(chunk)
                 logger.info(f"[{req.track_id}] Done: {fname}")
             except Exception as e:
                 logger.error(f"[{req.track_id}] Failed: {e}")
@@ -364,14 +371,45 @@ async def download_album(
         "quality":    quality,
     }
 
+# ─── Endpoint: Album Download Status ──────────────────────────────────────
+@app.get("/album-status/{album_id}", tags=["download"])
+async def album_status(
+    album_id:   str,
+    output_dir: str = Query("./downloads"),
+):
+    """Returns the download progress for an album (reads status.json from disk)."""
+    album     = await get_album(album_id)
+    artist    = album.get("artist", {}).get("name", "Unknown")
+    title     = album.get("title", album_id)
+    album_dir = os.path.join(output_dir, sanitize_filename(f"{artist} - {title}"))
+
+    status = _read_status(album_dir)
+    if not status:
+        raise HTTPException(404, "No status file found — has the download been started?")
+
+    done    = sum(1 for t in status.values() if t["status"] == "done")
+    errors  = sum(1 for t in status.values() if t["status"] == "error")
+    pending = sum(1 for t in status.values() if t["status"] == "pending")
+
+    return {
+        "album":   title,
+        "artist":  artist,
+        "done":    done,
+        "pending": pending,
+        "errors":  errors,
+        "tracks":  status,
+    }
+
 # ─── Internal: single-track background worker ─────────────────────────────
 async def _download_single(req: DownloadRequest, album_dir: str | None = None) -> None:
     """
     Downloads one track, honouring the global DOWNLOAD_SEM concurrency limit.
+    URL is fetched inside the semaphore so it is always fresh when the slot opens.
     If album_dir is provided, updates status.json on completion or failure.
     """
     async with DOWNLOAD_SEM:
         try:
+            # URL fetched here — inside the semaphore — so it's never stale
             url_data   = await get_download_url(req.track_id, req.quality)
             track_info = await get_track(req.track_id)
             title  = track_info.get("title", req.track_id)
@@ -383,11 +421,10 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
 
             logger.info(f"[{req.track_id}] Starting: {fname}")
 
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", url_data["url"]) as r:
-                    with open(out, "wb") as f:
-                        async for chunk in r.aiter_bytes(65536):
-                            f.write(chunk)
+            async with http_client.stream("GET", url_data["url"], timeout=None) as r:
+                with open(out, "wb") as f:
+                    async for chunk in r.aiter_bytes(65536):
+                        f.write(chunk)
 
             logger.info(f"[{req.track_id}] Done: {fname}")
 
