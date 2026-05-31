@@ -4,20 +4,33 @@ Exposes Qobuz functionalities on localhost:8000
 Compatible with programs like Spotiflac
 """
 
+import asyncio
 import hashlib
-import time
+import json
+import logging
 import os
 import re
-import httpx
+import time
 from contextlib import asynccontextmanager
 from typing import Literal
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+
+import httpx
 from dotenv import load_dotenv, set_key
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 load_dotenv()
+
+# ─── Logging ───────────────────────────────────────────────────────────────
+_log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _log_level, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("qobuz-api")
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 QOBUZ_BASE = "https://www.qobuz.com/api.json/0.2"
@@ -27,11 +40,44 @@ TOKEN      = os.getenv("QOBUZ_TOKEN", "")
 
 # Quality IDs
 QUALITY_MAP = {
-    "mp3":    5,   # MP3 320kbps
-    "flac":   6,   # FLAC 16-bit (CD quality)
-    "hi24":   7,   # FLAC 24-bit ≤96kHz
-    "hi96":  27,   # FLAC 24-bit >96kHz (Hi-Res)
+    "mp3":   5,   # MP3 320kbps
+    "flac":  6,   # FLAC 16-bit (CD quality)
+    "hi24":  7,   # FLAC 24-bit ≤96kHz
+    "hi96": 27,   # FLAC 24-bit >96kHz (Hi-Res)
 }
+
+# Semaphore: max 3 concurrent downloads at any time
+DOWNLOAD_SEM = asyncio.Semaphore(3)
+
+# ─── Helpers ───────────────────────────────────────────────────────────────
+def sanitize_filename(name: str) -> str:
+    """
+    Removes characters that are illegal in file names on Windows, macOS, and Linux.
+    Replaces them with '-', then collapses duplicate separators.
+    """
+    name = re.sub(r'[\\/*?:"<>|]', "-", name)
+    name = re.sub(r"-{2,}", "-", name)   # collapse consecutive dashes
+    name = re.sub(r" {2,}", " ", name)   # collapse consecutive spaces
+    return name.strip(" -")
+
+# ─── Status file helpers ───────────────────────────────────────────────────
+_STATUS_FILE = "status.json"
+
+def _read_status(album_dir: str) -> dict:
+    path = os.path.join(album_dir, _STATUS_FILE)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _write_status(album_dir: str, status: dict) -> None:
+    """Writes status atomically (rename trick) to avoid partial reads."""
+    path = os.path.join(album_dir, _STATUS_FILE)
+    tmp  = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(status, f, indent=2)
+    os.replace(tmp, path)   # atomic on POSIX; near-atomic on Windows
 
 # ─── Automatic Extraction ──────────────────────────────────────────────────
 async def auto_extract_keys():
@@ -44,43 +90,38 @@ async def auto_extract_keys():
     if APP_ID and SECRET:
         return
 
-    print("[*] Missing App ID or Secret. Starting automatic extraction from play.qobuz.com...")
+    logger.info("Missing App ID or Secret — starting automatic extraction from play.qobuz.com...")
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get("https://play.qobuz.com/login")
-
-            # Find all references to Web Player JS files
             scripts = re.findall(r'src=["\'](/resources/[^"\']+\.js)["\']', r.text)
 
             for script_path in scripts:
                 js_url = f"https://play.qobuz.com{script_path}"
-                r_js = await client.get(js_url)
-                js = r_js.text
+                r_js   = await client.get(js_url)
+                js     = r_js.text
 
-                # Extract APP_ID using regex
                 if not APP_ID:
                     match_id = re.search(r'app_id\s*:\s*["\']([^"\']+)["\']', js)
                     if match_id:
                         APP_ID = match_id.group(1)
                         set_key(".env", "QOBUZ_APP_ID", APP_ID)
-                        print(f"[+] App ID automatically extracted and saved: {APP_ID}")
+                        logger.info(f"App ID extracted and saved: {APP_ID}")
 
-                # Extract SECRET (usually a 32-character hex hash associated with the player)
                 if not SECRET:
                     secrets = re.findall(r'["\']([a-f0-9]{32})["\']', js)
                     if secrets:
                         SECRET = secrets[0]
                         set_key(".env", "QOBUZ_SECRET", SECRET)
-                        print(f"[+] App Secret automatically extracted and saved: {SECRET}")
+                        logger.info(f"App Secret extracted and saved: {SECRET}")
 
-                # If both are found, stop the loop
                 if APP_ID and SECRET:
                     break
 
             if not APP_ID or not SECRET:
-                print("[-] Unable to automatically extract keys from JS files.")
+                logger.warning("Unable to automatically extract keys from JS files.")
     except Exception as e:
-        print(f"[-] Connection error during extraction: {e}")
+        logger.error(f"Connection error during extraction: {e}")
 
 # ─── Lifespan ──────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -110,8 +151,8 @@ async def get_token() -> str:
     return TOKEN
 
 def make_sig(track_id: str, format_id: int) -> tuple[str, str]:
-    """Generates the HMAC signature required by track/getFileUrl"""
-    ts = str(int(time.time()))
+    """Generates the MD5 signature required by track/getFileUrl."""
+    ts  = str(int(time.time()))
     raw = f"trackgetFileUrlformat_id{format_id}intentstreamtrack_id{track_id}{ts}{SECRET}"
     sig = hashlib.md5(raw.encode()).hexdigest()
     return sig, ts
@@ -119,7 +160,6 @@ def make_sig(track_id: str, format_id: int) -> tuple[str, str]:
 async def qobuz_get(endpoint: str, params: dict) -> dict:
     if not APP_ID or not SECRET:
         raise HTTPException(500, "App ID and Secret unavailable. Configure .env or check connection to Qobuz.")
-
     token = await get_token()
     params.update({"app_id": APP_ID, "user_auth_token": token})
     async with httpx.AsyncClient(timeout=30) as client:
@@ -139,14 +179,14 @@ class DownloadRequest(BaseModel):
 @app.get("/", tags=["info"])
 async def root():
     return {
-        "status": "online",
-        "version": "1.0.0",
-        "docs": "http://localhost:8000/docs",
+        "status":    "online",
+        "version":   "1.0.0",
+        "docs":      "http://localhost:8000/docs",
         "endpoints": [
             "/search", "/track/{id}", "/album/{id}",
             "/artist/{id}", "/download-url/{track_id}",
             "/stream/{track_id}", "/download", "/download-album/{album_id}",
-        ]
+        ],
     }
 
 # ─── Endpoint: Search ──────────────────────────────────────────────────────
@@ -157,11 +197,7 @@ async def search(
     limit: int = Query(10, ge=1, le=50),
 ):
     """Searches for tracks, albums, or artists on Qobuz."""
-    return await qobuz_get("catalog/search", {
-        "query": q,
-        "type":  type,
-        "limit": limit,
-    })
+    return await qobuz_get("catalog/search", {"query": q, "type": type, "limit": limit})
 
 # ─── Endpoint: Track Info ──────────────────────────────────────────────────
 @app.get("/track/{track_id}", tags=["metadata"])
@@ -179,7 +215,7 @@ async def get_album(album_id: str):
 @app.get("/artist/{artist_id}", tags=["metadata"])
 async def get_artist(
     artist_id: str,
-    limit: int = Query(20, ge=1, le=100),
+    limit:     int = Query(20, ge=1, le=100),
 ):
     """Returns artist data along with their albums."""
     return await qobuz_get("artist/get", {
@@ -231,7 +267,7 @@ async def stream_track(
 ):
     """Streams the audio file directly through this API."""
     url_data = await get_download_url(track_id, quality)
-    url = url_data["url"]
+    url      = url_data["url"]
 
     async def generate():
         async with httpx.AsyncClient(timeout=None) as client:
@@ -247,24 +283,30 @@ async def stream_track(
 # ─── Endpoint: Download to Disk ────────────────────────────────────────────
 @app.post("/download", tags=["download"])
 async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks):
-    """Downloads a track to disk in the specified path."""
+    """Downloads a single track to disk in the specified path."""
     url_data   = await get_download_url(req.track_id, req.quality)
     track_info = await get_track(req.track_id)
 
-    artist = track_info.get("performer", {}).get("name", "Unknown Artist")
-    title  = track_info.get("title", req.track_id)
-    ext    = "mp3" if req.quality == "mp3" else "flac"
-    fname  = f"{artist} - {title}.{ext}".replace("/", "-").replace(":", "-")
+    artist   = track_info.get("performer", {}).get("name", "Unknown Artist")
+    title    = track_info.get("title", req.track_id)
+    ext      = "mp3" if req.quality == "mp3" else "flac"
+    fname    = sanitize_filename(f"{artist} - {title}") + f".{ext}"
 
     os.makedirs(req.output_dir, exist_ok=True)
     out_path = os.path.join(req.output_dir, fname)
 
     async def do_download():
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("GET", url_data["url"]) as r:
-                with open(out_path, "wb") as f:
-                    async for chunk in r.aiter_bytes(65536):
-                        f.write(chunk)
+        async with DOWNLOAD_SEM:
+            logger.info(f"[{req.track_id}] Starting: {fname}")
+            try:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    async with client.stream("GET", url_data["url"]) as r:
+                        with open(out_path, "wb") as f:
+                            async for chunk in r.aiter_bytes(65536):
+                                f.write(chunk)
+                logger.info(f"[{req.track_id}] Done: {fname}")
+            except Exception as e:
+                logger.error(f"[{req.track_id}] Failed: {e}")
 
     background_tasks.add_task(do_download)
 
@@ -284,7 +326,7 @@ async def download_album(
     quality:          Literal["mp3", "flac", "hi24", "hi96"] = Query("flac"),
     output_dir:       str = Query("./downloads"),
 ):
-    """Downloads all tracks from an album to disk."""
+    """Downloads all tracks from an album to disk (max 3 concurrent)."""
     album  = await get_album(album_id)
     tracks = album.get("tracks", {}).get("items", [])
     if not tracks:
@@ -292,14 +334,25 @@ async def download_album(
 
     artist_name = album.get("artist", {}).get("name", "Unknown")
     album_title = album.get("title", album_id)
-    album_dir   = os.path.join(output_dir, f"{artist_name} - {album_title}".replace("/", "-"))
+    album_dir   = os.path.join(
+        output_dir,
+        sanitize_filename(f"{artist_name} - {album_title}"),
+    )
     os.makedirs(album_dir, exist_ok=True)
 
+    # Initialise status.json so progress is trackable immediately
+    status = {
+        str(t["id"]): {"title": t.get("title", ""), "status": "pending"}
+        for t in tracks
+    }
+    _write_status(album_dir, status)
+    logger.info(f"Album download queued: {artist_name} — {album_title} ({len(tracks)} tracks)")
+
     for track in tracks:
-        tid = str(track["id"])
         background_tasks.add_task(
             _download_single,
-            DownloadRequest(track_id=tid, quality=quality, output_dir=album_dir)
+            DownloadRequest(track_id=str(track["id"]), quality=quality, output_dir=album_dir),
+            album_dir,
         )
 
     return {
@@ -311,22 +364,46 @@ async def download_album(
         "quality":    quality,
     }
 
-async def _download_single(req: DownloadRequest):
-    """Internal helper for background downloading."""
-    try:
-        url_data   = await get_download_url(req.track_id, req.quality)
-        track_info = await get_track(req.track_id)
-        title = track_info.get("title", req.track_id)
-        ext   = "mp3" if req.quality == "mp3" else "flac"
-        fname = f"{track_info.get('track_number', 0):02d} - {title}.{ext}".replace("/", "-")
-        out   = os.path.join(req.output_dir, fname)
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("GET", url_data["url"]) as r:
-                with open(out, "wb") as f:
-                    async for chunk in r.aiter_bytes(65536):
-                        f.write(chunk)
-    except Exception as e:
-        print(f"[ERROR] track {req.track_id}: {e}")
+# ─── Internal: single-track background worker ─────────────────────────────
+async def _download_single(req: DownloadRequest, album_dir: str | None = None) -> None:
+    """
+    Downloads one track, honouring the global DOWNLOAD_SEM concurrency limit.
+    If album_dir is provided, updates status.json on completion or failure.
+    """
+    async with DOWNLOAD_SEM:
+        try:
+            url_data   = await get_download_url(req.track_id, req.quality)
+            track_info = await get_track(req.track_id)
+            title  = track_info.get("title", req.track_id)
+            ext    = "mp3" if req.quality == "mp3" else "flac"
+            fname  = sanitize_filename(
+                f"{track_info.get('track_number', 0):02d} - {title}"
+            ) + f".{ext}"
+            out = os.path.join(req.output_dir, fname)
+
+            logger.info(f"[{req.track_id}] Starting: {fname}")
+
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", url_data["url"]) as r:
+                    with open(out, "wb") as f:
+                        async for chunk in r.aiter_bytes(65536):
+                            f.write(chunk)
+
+            logger.info(f"[{req.track_id}] Done: {fname}")
+
+            if album_dir:
+                status = _read_status(album_dir)
+                if req.track_id in status:
+                    status[req.track_id].update({"status": "done", "file": fname})
+                    _write_status(album_dir, status)
+
+        except Exception as e:
+            logger.error(f"[{req.track_id}] Failed: {e}")
+            if album_dir:
+                status = _read_status(album_dir)
+                if req.track_id in status:
+                    status[req.track_id].update({"status": "error", "error": str(e)})
+                    _write_status(album_dir, status)
 
 if __name__ == "__main__":
     import uvicorn

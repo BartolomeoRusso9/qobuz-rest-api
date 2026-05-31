@@ -18,6 +18,7 @@ cp .env.example .env
 | `QOBUZ_APP_ID` | Qobuz App ID — if left empty, extracted automatically on startup |
 | `QOBUZ_SECRET` | Qobuz Secret — if left empty, extracted automatically on startup |
 | `QOBUZ_TOKEN` | User token → localStorage of [play.qobuz.com](https://play.qobuz.com), key `localuser.token` |
+| `LOG_LEVEL` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
 
 > [!NOTE]
 > `QOBUZ_APP_ID` and `QOBUZ_SECRET` are optional. If missing, the server extracts them automatically from the Qobuz web player on startup and saves them to `.env` for future restarts.
@@ -50,6 +51,7 @@ Run with your token:
 docker run -d \
   -p 8000:8000 \
   -e QOBUZ_TOKEN=your_token_here \
+  -e LOG_LEVEL=INFO \
   ghcr.io/bartolomeorusso9/qobuz-api:main
 ```
 
@@ -498,7 +500,7 @@ Downloads a track to disk in the background. Returns immediately.
 
 ### `POST /download-album/{album_id}`
 
-Downloads all tracks from an album to disk in the background. Returns immediately.
+Downloads all tracks from an album to disk in the background. Returns immediately. At most **3 tracks** are downloaded concurrently; remaining tracks are queued automatically.
 
 #### Params
 
@@ -522,7 +524,15 @@ Downloads all tracks from an album to disk in the background. Returns immediatel
 ```
 
 > [!NOTE]
-> All tracks download in the background concurrently. The response is returned immediately — check `output_dir` to monitor progress.
+> All tracks download in the background with a concurrency limit of 3. Progress is tracked in `status.json` inside `output_dir`. Each track entry transitions from `"pending"` → `"done"` (with a `"file"` field) or `"error"` (with an `"error"` field). Check that file to monitor progress or detect failures after a server restart.
+
+```json
+{
+  "420232043": { "title": "Omen Of A Sea", "status": "done",    "file": "01 - Omen Of A Sea.flac" },
+  "420232044": { "title": "Noè",           "status": "pending"                                    },
+  "420232045": { "title": "...",            "status": "error",   "error": "403 Forbidden"          }
+}
+```
 
 ---
 
@@ -568,4 +578,7 @@ curl -X POST http://localhost:8000/download \
 
 # Download full album to disk
 curl -X POST "http://localhost:8000/download-album/em5pzj2fxalfl?quality=hi24&output_dir=./music"
+
+# Check album download progress
+cat "./music/Francesco Cavestri - Noè/status.json"
 ```
