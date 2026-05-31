@@ -1,7 +1,5 @@
 # qobuz-api
 
-A local REST API on `http://localhost:8000` that exposes Qobuz functions for use by any program (e.g. Spotiflac, Python scripts, etc.)
-
 > [!IMPORTANT]
 > Music piracy is illegal in most countries. This project is intended for use with a valid Qobuz subscription for personal/educational purposes (e.g. in your homelab). Use responsibly.
 
