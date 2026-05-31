@@ -1,0 +1,13 @@
+services:
+  web:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "0.0.0.0:8000:8000"
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
+networks:
+  default:
+    driver: bridge

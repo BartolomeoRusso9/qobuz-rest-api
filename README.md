@@ -38,6 +38,32 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 Interactive docs available at **http://localhost:8000/docs**
 
+### Docker
+
+A pre-built image is published automatically to the GitHub Container Registry on every push to `main`.
+
+```bash
+docker pull ghcr.io/bartolomeorusso9/qobuz-api:main
+```
+
+Run with your token:
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -e QOBUZ_TOKEN=your_token_here \
+  ghcr.io/bartolomeorusso9/qobuz-api:main
+```
+
+Or with a `.env` file:
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  --env-file .env \
+  ghcr.io/bartolomeorusso9/qobuz-api:main
+```
+
 ---
 
 ## API Schema

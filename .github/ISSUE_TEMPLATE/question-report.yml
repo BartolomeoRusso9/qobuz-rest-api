@@ -1,0 +1,30 @@
+name: Question
+description: Ask a question about qobuz-api.
+title: "[QUESTION]: "
+labels: question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues and discussions before opening a new one to avoid duplicates.
+  - type: textarea
+    id: question
+    attributes:
+      label: Describe your question
+      description: Describe your question as accurately as possible.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Any relevant details — OS, Python version, how you configured the .env, etc.
+    validations:
+      required: false
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or logs
+      description: Add screenshots or terminal output if available.
+    validations:
+      required: false
