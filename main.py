@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+import uvicorn
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -574,5 +575,4 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
 
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
