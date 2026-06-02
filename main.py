@@ -38,6 +38,10 @@ APP_ID     = os.getenv("QOBUZ_APP_ID", "")
 SECRET     = os.getenv("QOBUZ_SECRET", "")
 TOKEN      = os.getenv("QOBUZ_TOKEN", "")
 
+# [IMPROVEMENT 5] DEV_MODE: logs status, headers and body of every upstream response.
+# Enable with DEV_MODE=true in .env — never enable in production.
+DEV_MODE = os.getenv("DEV_MODE", "False").lower() in ("true", "1", "yes")
+
 # Quality IDs
 QUALITY_MAP = {
     "mp3":   5,   # MP3 320kbps
@@ -46,11 +50,17 @@ QUALITY_MAP = {
     "hi96": 27,   # FLAC 24-bit >96kHz (Hi-Res)
 }
 
+# [IMPROVEMENT 1] Rate-limit retry settings
+_RATE_LIMIT_MAX_RETRIES = 3
+_RATE_LIMIT_BASE_DELAY  = 1.0   # seconds, doubles each attempt
+_RATE_LIMIT_MAX_DELAY   = 15.0  # hard cap
+
 # Semaphore: max 3 concurrent downloads at any time
 DOWNLOAD_SEM = asyncio.Semaphore(3)
 
 # Shared HTTP client — initialised in lifespan, reused across all requests
 http_client: httpx.AsyncClient | None = None
+
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 def sanitize_filename(name: str) -> str:
@@ -59,9 +69,10 @@ def sanitize_filename(name: str) -> str:
     Replaces them with '-', then collapses duplicate separators.
     """
     name = re.sub(r'[\\/*?:"<>|]', "-", name)
-    name = re.sub(r"-{2,}", "-", name)   # collapse consecutive dashes
-    name = re.sub(r" {2,}", " ", name)   # collapse consecutive spaces
+    name = re.sub(r"-{2,}", "-", name)
+    name = re.sub(r" {2,}", " ", name)
     return name.strip(" -")
+
 
 # ─── Status file helpers ───────────────────────────────────────────────────
 _STATUS_FILE = "status.json"
@@ -80,7 +91,23 @@ def _write_status(album_dir: str, status: dict) -> None:
     tmp  = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(status, f, indent=2)
-    os.replace(tmp, path)   # atomic on POSIX; near-atomic on Windows
+    os.replace(tmp, path)
+
+
+# ─── [IMPROVEMENT 5] DEV_MODE upstream logger ─────────────────────────────
+def _log_response(method: str, url: str, resp: httpx.Response) -> None:
+    """Log upstream response details when DEV_MODE is enabled."""
+    if not DEV_MODE:
+        return
+    logger.debug(
+        "[DEV] %s %s → %s\n  headers: %s\n  body: %s",
+        method,
+        url,
+        resp.status_code,
+        dict(resp.headers),
+        resp.text[:2000],
+    )
+
 
 # ─── Automatic Extraction ──────────────────────────────────────────────────
 async def auto_extract_keys():
@@ -96,11 +123,13 @@ async def auto_extract_keys():
     logger.info("Missing App ID or Secret — starting automatic extraction from play.qobuz.com...")
     try:
         r = await http_client.get("https://play.qobuz.com/login")
+        _log_response("GET", "https://play.qobuz.com/login", r)
         scripts = re.findall(r'src=["\'](/resources/[^"\']+\.js)["\']', r.text)
 
         for script_path in scripts:
             js_url = f"https://play.qobuz.com{script_path}"
             r_js   = await http_client.get(js_url)
+            _log_response("GET", js_url, r_js)
             js     = r_js.text
 
             if not APP_ID:
@@ -125,14 +154,26 @@ async def auto_extract_keys():
     except Exception as e:
         logger.error(f"Connection error during extraction: {e}")
 
-# ─── Lifespan ──────────────────────────────────────────────────────────────
+
+# ─── [IMPROVEMENT 2] Lifespan — HTTP/2 client with connection pooling ──────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-    http_client = httpx.AsyncClient(timeout=30)
+    if DEV_MODE:
+        logger.warning("DEV_MODE is enabled — upstream responses will be logged at DEBUG level")
+    http_client = httpx.AsyncClient(
+        http2=True,
+        timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=30.0),
+        limits=httpx.Limits(
+            max_keepalive_connections=100,
+            max_connections=200,
+            keepalive_expiry=30.0,
+        ),
+    )
     await auto_extract_keys()
     yield
     await http_client.aclose()
+
 
 # ─── App ───────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -149,6 +190,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ─── Authentication ────────────────────────────────────────────────────────
 async def get_token() -> str:
     if not TOKEN:
@@ -162,22 +204,87 @@ def make_sig(track_id: str, format_id: int) -> tuple[str, str]:
     sig = hashlib.md5(raw.encode()).hexdigest()
     return sig, ts
 
+
+# ─── [IMPROVEMENT 1 + 3 + 4] Core request helper ──────────────────────────
 async def qobuz_get(endpoint: str, params: dict) -> dict:
+    """
+    Authenticated GET against the Qobuz API with:
+      - Retry + exponential backoff on 429 (rate limit)         [improvement 1]
+      - Explicit 401 error message                              [improvement 4]
+      - Structured network-error handling (timeout vs other)    [improvement 3]
+      - DEV_MODE response logging                               [improvement 5]
+    """
     if not APP_ID or not SECRET:
-        raise HTTPException(500, "App ID and Secret unavailable. Configure .env or check connection to Qobuz.")
+        raise HTTPException(
+            500,
+            "App ID and Secret unavailable. Configure .env or check connection to Qobuz.",
+        )
     token = await get_token()
-    params.update({"app_id": APP_ID, "user_auth_token": token})
-    r = await http_client.get(f"{QOBUZ_BASE}/{endpoint}", params=params)
-    data = r.json()
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, data.get("message", "Qobuz Error"))
-    return data
+    params = {**params, "app_id": APP_ID, "user_auth_token": token}
+    url = f"{QOBUZ_BASE}/{endpoint}"
+
+    # [IMPROVEMENT 3] Wrap everything in a single network-error handler
+    try:
+        # [IMPROVEMENT 1] Retry loop with exponential backoff on 429
+        for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+            r = await http_client.get(url, params=params)
+            _log_response("GET", url, r)   # [IMPROVEMENT 5]
+
+            # [IMPROVEMENT 4] Explicit 401 handling
+            if r.status_code == 401:
+                raise HTTPException(
+                    401,
+                    "Qobuz rejected the token (401). "
+                    "Your QOBUZ_TOKEN may have expired — refresh it from localStorage at play.qobuz.com.",
+                )
+
+            # [IMPROVEMENT 1] Rate-limit backoff
+            if r.status_code == 429 and attempt < _RATE_LIMIT_MAX_RETRIES:
+                delay = min(_RATE_LIMIT_BASE_DELAY * (2 ** attempt), _RATE_LIMIT_MAX_DELAY)
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = min(float(retry_after), _RATE_LIMIT_MAX_DELAY)
+                    except ValueError:
+                        pass
+                logger.warning(
+                    "Qobuz rate-limited (429) on %s — retrying in %.1fs (attempt %d/%d)",
+                    endpoint, delay, attempt + 1, _RATE_LIMIT_MAX_RETRIES,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            # All other non-2xx responses
+            if r.status_code != 200:
+                data = {}
+                try:
+                    data = r.json()
+                except Exception:
+                    pass
+                raise HTTPException(r.status_code, data.get("message", "Qobuz API error"))
+
+            return r.json()
+
+        # Exhausted retries on 429
+        raise HTTPException(429, "Qobuz rate limit exceeded — all retry attempts exhausted")
+
+    # [IMPROVEMENT 3] Distinguish timeout from general network errors
+    except HTTPException:
+        raise
+    except httpx.TimeoutException as e:
+        logger.error("Timeout calling Qobuz endpoint %s: %s", endpoint, e)
+        raise HTTPException(504, "Qobuz API timed out — try again shortly")
+    except httpx.RequestError as e:
+        logger.error("Network error calling Qobuz endpoint %s: %s", endpoint, e)
+        raise HTTPException(503, f"Connection error to Qobuz: {e}")
+
 
 # ─── Models ────────────────────────────────────────────────────────────────
 class DownloadRequest(BaseModel):
     track_id:   str
     quality:    Literal["mp3", "flac", "hi24", "hi96"] = "flac"
     output_dir: str = "./downloads"
+
 
 # ─── Endpoint: Health ──────────────────────────────────────────────────────
 @app.get("/", tags=["info"])
@@ -194,6 +301,7 @@ async def root():
         ],
     }
 
+
 # ─── Endpoint: Search ──────────────────────────────────────────────────────
 @app.get("/search", tags=["search"])
 async def search(
@@ -204,17 +312,20 @@ async def search(
     """Searches for tracks, albums, or artists on Qobuz."""
     return await qobuz_get("catalog/search", {"query": q, "type": type, "limit": limit})
 
+
 # ─── Endpoint: Track Info ──────────────────────────────────────────────────
 @app.get("/track/{track_id}", tags=["metadata"])
 async def get_track(track_id: str):
     """Returns complete metadata for a track."""
     return await qobuz_get("track/get", {"track_id": track_id})
 
+
 # ─── Endpoint: Album Info ──────────────────────────────────────────────────
 @app.get("/album/{album_id}", tags=["metadata"])
 async def get_album(album_id: str):
     """Returns album metadata and the tracklist."""
     return await qobuz_get("album/get", {"album_id": album_id})
+
 
 # ─── Endpoint: Artist Info ─────────────────────────────────────────────────
 @app.get("/artist/{artist_id}", tags=["metadata"])
@@ -228,6 +339,7 @@ async def get_artist(
         "extra":     "albums",
         "limit":     limit,
     })
+
 
 # ─── Endpoint: Download URL ────────────────────────────────────────────────
 @app.get("/download-url/{track_id}", tags=["download"])
@@ -251,7 +363,10 @@ async def get_download_url(
     })
 
     if "url" not in data:
-        raise HTTPException(403, data.get("message", "URL not available (unsupported quality or insufficient subscription)"))
+        raise HTTPException(
+            403,
+            data.get("message", "URL not available (unsupported quality or insufficient subscription)"),
+        )
 
     return {
         "track_id":      track_id,
@@ -264,6 +379,7 @@ async def get_download_url(
         "file_size":     data.get("file_size"),
     }
 
+
 # ─── Endpoint: Direct Stream ───────────────────────────────────────────────
 @app.get("/stream/{track_id}", tags=["download"])
 async def stream_track(
@@ -274,23 +390,27 @@ async def stream_track(
     url_data = await get_download_url(track_id, quality)
     url      = url_data["url"]
 
+    # [IMPROVEMENT 3] Network errors during streaming are handled explicitly
     async def generate():
-        async with http_client.stream("GET", url, timeout=None) as r:
-            async for chunk in r.aiter_bytes(chunk_size=65536):
-                yield chunk
+        try:
+            async with http_client.stream("GET", url, timeout=None) as r:
+                async for chunk in r.aiter_bytes(chunk_size=65536):
+                    yield chunk
+        except httpx.TimeoutException:
+            logger.error("Timeout while streaming track %s", track_id)
+        except httpx.RequestError as e:
+            logger.error("Network error while streaming track %s: %s", track_id, e)
 
     mime = url_data.get("mime_type") or (
         "audio/mpeg" if quality == "mp3" else "audio/flac"
     )
     return StreamingResponse(generate(), media_type=mime)
 
+
 # ─── Endpoint: Download to Disk ────────────────────────────────────────────
 @app.post("/download", tags=["download"])
 async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks):
     """Downloads a single track to disk in the specified path."""
-    # Fetch track info now so we can return the filename in the response immediately.
-    # The signed URL is intentionally NOT fetched here — it would expire while
-    # waiting to acquire the semaphore. It is fetched fresh inside do_download.
     track_info = await get_track(req.track_id)
 
     artist   = track_info.get("performer", {}).get("name", "Unknown Artist")
@@ -303,15 +423,19 @@ async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks
 
     async def do_download():
         async with DOWNLOAD_SEM:
-            # URL fetched here — always fresh when the semaphore slot opens
             url_data = await get_download_url(req.track_id, req.quality)
             logger.info(f"[{req.track_id}] Starting: {fname}")
+            # [IMPROVEMENT 3] Explicit network error handling in background task
             try:
                 async with http_client.stream("GET", url_data["url"], timeout=None) as r:
                     with open(out_path, "wb") as f:
                         async for chunk in r.aiter_bytes(65536):
                             f.write(chunk)
                 logger.info(f"[{req.track_id}] Done: {fname}")
+            except httpx.TimeoutException:
+                logger.error(f"[{req.track_id}] Timeout while downloading {fname}")
+            except httpx.RequestError as e:
+                logger.error(f"[{req.track_id}] Network error while downloading {fname}: {e}")
             except Exception as e:
                 logger.error(f"[{req.track_id}] Failed: {e}")
 
@@ -324,6 +448,7 @@ async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks
         "output":   out_path,
         "quality":  req.quality,
     }
+
 
 # ─── Endpoint: Full Album Download ─────────────────────────────────────────
 @app.post("/download-album/{album_id}", tags=["download"])
@@ -347,7 +472,6 @@ async def download_album(
     )
     os.makedirs(album_dir, exist_ok=True)
 
-    # Initialise status.json so progress is trackable immediately
     status = {
         str(t["id"]): {"title": t.get("title", ""), "status": "pending"}
         for t in tracks
@@ -370,6 +494,7 @@ async def download_album(
         "output_dir": album_dir,
         "quality":    quality,
     }
+
 
 # ─── Endpoint: Album Download Status ──────────────────────────────────────
 @app.get("/album-status/{album_id}", tags=["download"])
@@ -400,6 +525,7 @@ async def album_status(
         "tracks":  status,
     }
 
+
 # ─── Internal: single-track background worker ─────────────────────────────
 async def _download_single(req: DownloadRequest, album_dir: str | None = None) -> None:
     """
@@ -409,7 +535,6 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
     """
     async with DOWNLOAD_SEM:
         try:
-            # URL fetched here — inside the semaphore — so it's never stale
             url_data   = await get_download_url(req.track_id, req.quality)
             track_info = await get_track(req.track_id)
             title  = track_info.get("title", req.track_id)
@@ -421,12 +546,17 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
 
             logger.info(f"[{req.track_id}] Starting: {fname}")
 
-            async with http_client.stream("GET", url_data["url"], timeout=None) as r:
-                with open(out, "wb") as f:
-                    async for chunk in r.aiter_bytes(65536):
-                        f.write(chunk)
-
-            logger.info(f"[{req.track_id}] Done: {fname}")
+            # [IMPROVEMENT 3] Explicit network error handling
+            try:
+                async with http_client.stream("GET", url_data["url"], timeout=None) as r:
+                    with open(out, "wb") as f:
+                        async for chunk in r.aiter_bytes(65536):
+                            f.write(chunk)
+                logger.info(f"[{req.track_id}] Done: {fname}")
+            except httpx.TimeoutException as e:
+                raise Exception(f"Timeout during file download: {e}")
+            except httpx.RequestError as e:
+                raise Exception(f"Network error during file download: {e}")
 
             if album_dir:
                 status = _read_status(album_dir)
@@ -441,6 +571,7 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
                 if req.track_id in status:
                     status[req.track_id].update({"status": "error", "error": str(e)})
                     _write_status(album_dir, status)
+
 
 if __name__ == "__main__":
     import uvicorn
