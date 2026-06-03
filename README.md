@@ -15,13 +15,13 @@ cp .env.example .env
 
 | Variable | Description |
 |---|---|
-| `QOBUZ_APP_ID` | Qobuz App ID — if left empty, extracted automatically on startup |
-| `QOBUZ_SECRET` | Qobuz Secret — if left empty, extracted automatically on startup |
+| `QOBUZ_APP_ID` | Qobuz App ID — see [Finding APP_ID and SECRET](#finding-app_id-and-secret) |
+| `QOBUZ_SECRET` | Qobuz Secret — see [Finding APP_ID and SECRET](#finding-app_id-and-secret) |
 | `QOBUZ_TOKEN` | User token → localStorage of [play.qobuz.com](https://play.qobuz.com), key `localuser.token` |
 | `LOG_LEVEL` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
 
-> [!NOTE]
-> `QOBUZ_APP_ID` and `QOBUZ_SECRET` are optional. If missing, the server extracts them automatically from the Qobuz web player on startup and saves them to `.env` for future restarts.
+> [!IMPORTANT]
+> `QOBUZ_APP_ID` and `QOBUZ_SECRET` must be set manually. APP_ID and SECRET are a matched pair — using mismatched values will cause `400 Invalid Request Signature` errors on all download endpoints.
 
 Start the server with:
 
@@ -63,6 +63,47 @@ docker run -d \
   --env-file .env \
   ghcr.io/bartolomeorusso9/qobuz-api:main
 ```
+
+---
+
+## Finding APP_ID and SECRET
+
+APP_ID and SECRET must be extracted manually from the Qobuz web player. They are a matched pair — always use them together.
+
+**1. Get the APP_ID**
+
+Open [play.qobuz.com](https://play.qobuz.com), open DevTools (`F12` / `Cmd+Option+I`), go to the **Network** tab and play any track. Click on a `track/getFileUrl` request — the `app_id` is visible in the query parameters.
+
+**2. Get the SECRET**
+
+In the DevTools **Console**, run:
+
+```javascript
+fetch('https://play.qobuz.com/resources/8.1.0-b019/bundle.js')
+  .then(r => r.text())
+  .then(js => {
+    const secrets = [...new Set([...js.matchAll(/[^a-f0-9]([a-f0-9]{32})[^a-f0-9]/g)].map(m => m[1]))]
+    alert('SECRETs:\n' + secrets.slice(0, 5).join('\n'))
+  })
+```
+
+> [!NOTE]
+> The bundle path (`8.1.0-b019`) changes with each Qobuz release. Find the current one by running in the console:
+> ```javascript
+> performance.getEntriesByType('resource').filter(r => r.name.endsWith('.js') && r.name.includes('/resources/')).map(r => r.name)
+> ```
+
+**3. Get the QOBUZ_TOKEN**
+
+In DevTools go to **Application → Local Storage → play.qobuz.com**, or run in the console:
+
+```javascript
+JSON.parse(localStorage.getItem('localuser')).token
+```
+
+**4. Test the pair**
+
+Try each APP_ID candidate with the first SECRET until `/download-url/{track_id}` returns `200 OK` instead of `400 Invalid Request Signature`.
 
 ---
 

@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 import httpx
-from dotenv import load_dotenv, set_key
+from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -35,9 +35,9 @@ logger = logging.getLogger("qobuz-api")
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 QOBUZ_BASE = "https://www.qobuz.com/api.json/0.2"
-APP_ID     = os.getenv("QOBUZ_APP_ID", "")
-SECRET     = os.getenv("QOBUZ_SECRET", "")
-TOKEN      = os.getenv("QOBUZ_TOKEN", "")
+APP_ID = os.getenv("QOBUZ_APP_ID", "").strip("'\"")
+SECRET = os.getenv("QOBUZ_SECRET", "").strip("'\"")
+TOKEN  = os.getenv("QOBUZ_TOKEN",  "").strip("'\"")
 
 # [IMPROVEMENT 5] DEV_MODE: logs status, headers and body of every upstream response.
 # Enable with DEV_MODE=true in .env — never enable in production.
@@ -94,7 +94,6 @@ def _write_status(album_dir: str, status: dict) -> None:
         json.dump(status, f, indent=2)
     os.replace(tmp, path)
 
-
 # ─── [IMPROVEMENT 5] DEV_MODE upstream logger ─────────────────────────────
 def _log_response(method: str, url: str, resp: httpx.Response) -> None:
     """Log upstream response details when DEV_MODE is enabled."""
@@ -109,54 +108,6 @@ def _log_response(method: str, url: str, resp: httpx.Response) -> None:
         resp.text[:2000],
     )
 
-
-# ─── Automatic Extraction ──────────────────────────────────────────────────
-async def auto_extract_keys():
-    """
-    Integrates the Qobuz-AppID-Secret-Tool logic to automatically extract
-    App ID and Secret from the web player if they are missing in the .env file.
-    Extracted values are persisted to .env so they survive restarts.
-    """
-    global APP_ID, SECRET
-    if APP_ID and SECRET:
-        return
-
-    logger.info("Missing App ID or Secret — starting automatic extraction from play.qobuz.com...")
-    try:
-        r = await http_client.get("https://play.qobuz.com/login")
-        _log_response("GET", "https://play.qobuz.com/login", r)
-        scripts = re.findall(r'src=["\'](/resources/[^"\']+\.js)["\']', r.text)
-
-        for script_path in scripts:
-            js_url = f"https://play.qobuz.com{script_path}"
-            r_js   = await http_client.get(js_url)
-            _log_response("GET", js_url, r_js)
-            js     = r_js.text
-
-            if not APP_ID:
-                match_id = re.search(r'app_id\s*:\s*["\']([^"\']+)["\']', js)
-                if match_id:
-                    APP_ID = match_id.group(1)
-                    set_key(".env", "QOBUZ_APP_ID", APP_ID)
-                    logger.info(f"App ID extracted and saved: {APP_ID}")
-
-            if not SECRET:
-                secrets = re.findall(r'["\']([a-f0-9]{32})["\']', js)
-                if secrets:
-                    SECRET = secrets[0]
-                    set_key(".env", "QOBUZ_SECRET", SECRET)
-                    logger.info(f"App Secret extracted and saved: {SECRET}")
-
-            if APP_ID and SECRET:
-                break
-
-        if not APP_ID or not SECRET:
-            logger.warning("Unable to automatically extract keys from JS files.")
-    except Exception as e:
-        logger.error(f"Connection error during extraction: {e}")
-
-
-# ─── [IMPROVEMENT 2] Lifespan — HTTP/2 client with connection pooling ──────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
@@ -171,10 +122,8 @@ async def lifespan(app: FastAPI):
             keepalive_expiry=30.0,
         ),
     )
-    await auto_extract_keys()
     yield
     await http_client.aclose()
-
 
 # ─── App ───────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -235,9 +184,9 @@ async def qobuz_get(endpoint: str, params: dict) -> dict:
             if r.status_code == 401:
                 raise HTTPException(
                     401,
-                    "Qobuz rejected the token (401). "
-                    "Your QOBUZ_TOKEN may have expired — refresh it from localStorage at play.qobuz.com.",
-                )
+                    "Token Qobuz not valid or expired. "
+                    "Update QOBUZ_TOKEN in .env by fetching it from localStorage on play.qobuz.com.",
+                )  
 
             # [IMPROVEMENT 1] Rate-limit backoff
             if r.status_code == 429 and attempt < _RATE_LIMIT_MAX_RETRIES:
@@ -412,6 +361,7 @@ async def stream_track(
 @app.post("/download", tags=["download"])
 async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks):
     """Downloads a single track to disk in the specified path."""
+    url_data   = await get_download_url(req.track_id, req.quality)   # ← fuori dal background
     track_info = await get_track(req.track_id)
 
     artist   = track_info.get("performer", {}).get("name", "Unknown Artist")
@@ -424,9 +374,7 @@ async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks
 
     async def do_download():
         async with DOWNLOAD_SEM:
-            url_data = await get_download_url(req.track_id, req.quality)
             logger.info(f"[{req.track_id}] Starting: {fname}")
-            # [IMPROVEMENT 3] Explicit network error handling in background task
             try:
                 async with http_client.stream("GET", url_data["url"], timeout=None) as r:
                     with open(out_path, "wb") as f:
@@ -448,6 +396,7 @@ async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks
         "filename": fname,
         "output":   out_path,
         "quality":  req.quality,
+        "url":      url_data["url"],
     }
 
 
