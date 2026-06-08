@@ -1,9 +1,3 @@
-"""
-Qobuz Local API Server
-Exposes Qobuz functionalities on localhost:8000
-Compatible with programs like Spotiflac
-"""
-
 import asyncio
 import hashlib
 import json
@@ -12,6 +6,11 @@ import os
 import re
 import time
 import uvicorn
+import subprocess
+import shutil
+from fastapi.responses import FileResponse
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, APIC, ID3NoHeaderError, TCON, TDRC, TCOP, TSRC, TCOM, TPUB, TPOS, TXXX, COMM, TLEN, WXXX, USLT
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -74,6 +73,142 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r" {2,}", " ", name)
     return name.strip(" -")
 
+def _apply_metadata(file_path: str, track_info: dict, album_info: dict, cover_bytes: bytes | None, lyrics_text: str = ""):
+    """Applica tutti i metadati possibili estratti da Qobuz (inclusi i testi) al file audio."""
+    ext = file_path.split('.')[-1].lower()
+    
+    # 1. DATI BASE
+    title = track_info.get("title", "Sconosciuto")
+    version = track_info.get("version")
+    if version:  # Se esiste una versione (es. Remastered), la aggiungiamo al titolo
+        title = f"{title} ({version})"
+        
+    artist = track_info.get("performer", {}).get("name")
+    if not artist:
+         artist = album_info.get("artist", {}).get("name", "Sconosciuto")
+    album = album_info.get("title", "Sconosciuto")
+    
+    # 2. TRACCE E DISCHI
+    track_num = str(track_info.get("track_number", 1))
+    total_tracks = str(album_info.get("tracks_count", track_num))
+    disc_num = str(track_info.get("media_number", 1))
+    total_discs = str(album_info.get("media_count", 1))
+
+    # 3. METADATI ESTESI
+    genre = album_info.get("genre", {}).get("name", "")
+    release_date = track_info.get("release_date_original") or album_info.get("release_date_original", "")
+    copyright_text = track_info.get("copyright") or album_info.get("copyright", "")
+    isrc = track_info.get("isrc", "")
+    composer = track_info.get("composer", {}).get("name", "")
+    label = album_info.get("label", {}).get("name", "")
+    upc = album_info.get("upc", "")
+    
+    # 4. AUDIO, DURATA E CREDITI
+    duration_sec = track_info.get("duration")
+    replay_gain = track_info.get("audio_info", {}).get("replaygain_track_gain")
+    replay_peak = track_info.get("audio_info", {}).get("replaygain_track_peak")
+    explicit = track_info.get("parental_warning", False)
+    credits_text = track_info.get("performers", "")
+    tech_specs = album_info.get("maximum_technical_specifications", "")
+    
+    # 5. ID QOBUZ ED EXTRA
+    qobuz_track_id = str(track_info.get("id", ""))
+    qobuz_album_id = str(album_info.get("qobuz_id", ""))
+    album_url = album_info.get("url", "")
+    
+    # Estraiamo eventuali premi (es. "La discografia ideale di Qobuz")
+    awards = album_info.get("awards", [])
+    awards_str = ", ".join([award.get("name") for award in awards]) if awards else ""
+
+    # --- INIEZIONE FLAC (Vorbis Comments) ---
+    if ext == "flac":
+        audio = FLAC(file_path)
+        
+        audio["title"] = [title]
+        audio["artist"] = [artist]
+        audio["album"] = [album]
+        audio["tracknumber"] = [track_num]
+        audio["totaltracks"] = [total_tracks]
+        audio["discnumber"] = [disc_num]
+        audio["totaldiscs"] = [total_discs]
+        
+        if genre: audio["genre"] = [genre]
+        if release_date: audio["date"] = [release_date]
+        if copyright_text: audio["copyright"] = [copyright_text]
+        if isrc: audio["isrc"] = [isrc]
+        if composer: audio["composer"] = [composer]
+        if label: audio["organization"] = [label]
+        if upc: audio["barcode"] = [upc]
+        
+        if duration_sec: audio["length"] = [str(duration_sec * 1000)] # FLAC usa i ms per la lunghezza
+        if replay_gain is not None: audio["replaygain_track_gain"] = [f"{replay_gain} dB"]
+        if replay_peak is not None: audio["replaygain_track_peak"] = [str(replay_peak)]
+        if explicit: audio["itunesadvisory"] = ["1"]
+        if credits_text: audio["comment"] = [credits_text]
+        
+        # Testi della canzone (Lyrics)
+        if lyrics_text: audio["lyrics"] = [lyrics_text]
+        
+        # Campi Personalizzati / Specifici
+        if tech_specs: audio["technical_specifications"] = [tech_specs]
+        if qobuz_track_id: audio["qobuz_track_id"] = [qobuz_track_id]
+        if qobuz_album_id: audio["qobuz_album_id"] = [qobuz_album_id]
+        if album_url: audio["url"] = [album_url]
+        if awards_str: audio["awards"] = [awards_str]
+        
+        if cover_bytes:
+            pic = Picture()
+            pic.type = 3
+            pic.mime = "image/jpeg"
+            pic.desc = "Cover"
+            pic.data = cover_bytes
+            audio.clear_pictures()
+            audio.add_picture(pic)
+            
+        audio.save()
+        
+    # --- INIEZIONE MP3 (ID3v2.3) ---
+    elif ext == "mp3":
+        try:
+            audio = ID3(file_path)
+        except ID3NoHeaderError:
+            audio = ID3()
+            
+        audio.add(TIT2(encoding=3, text=[title]))
+        audio.add(TPE1(encoding=3, text=[artist]))
+        audio.add(TALB(encoding=3, text=[album]))
+        
+        audio.add(TRCK(encoding=3, text=[f"{track_num}/{total_tracks}"]))
+        audio.add(TPOS(encoding=3, text=[f"{disc_num}/{total_discs}"]))
+        
+        if genre: audio.add(TCON(encoding=3, text=[genre]))
+        if release_date: audio.add(TDRC(encoding=3, text=[release_date]))
+        if copyright_text: audio.add(TCOP(encoding=3, text=[copyright_text]))
+        if isrc: audio.add(TSRC(encoding=3, text=[isrc]))
+        if composer: audio.add(TCOM(encoding=3, text=[composer]))
+        if label: audio.add(TPUB(encoding=3, text=[label]))
+        
+        if duration_sec: audio.add(TLEN(encoding=3, text=[str(duration_sec * 1000)]))
+        
+        # Testi della canzone (Lyrics)
+        if lyrics_text: audio.add(USLT(encoding=3, lang="und", desc="", text=lyrics_text))
+        
+        # Campi Personalizzati in MP3 tramite TXXX (User defined text information)
+        if replay_gain is not None: audio.add(TXXX(encoding=3, desc="REPLAYGAIN_TRACK_GAIN", text=[f"{replay_gain} dB"]))
+        if replay_peak is not None: audio.add(TXXX(encoding=3, desc="REPLAYGAIN_TRACK_PEAK", text=[str(replay_peak)]))
+        if tech_specs: audio.add(TXXX(encoding=3, desc="TECHNICAL_SPECIFICATIONS", text=[tech_specs]))
+        if qobuz_track_id: audio.add(TXXX(encoding=3, desc="QOBUZ_TRACK_ID", text=[qobuz_track_id]))
+        if qobuz_album_id: audio.add(TXXX(encoding=3, desc="QOBUZ_ALBUM_ID", text=[qobuz_album_id]))
+        if upc: audio.add(TXXX(encoding=3, desc="BARCODE", text=[upc]))
+        if awards_str: audio.add(TXXX(encoding=3, desc="AWARDS", text=[awards_str]))
+        
+        if credits_text: audio.add(COMM(encoding=3, lang="eng", desc="Credits", text=[credits_text]))
+        if album_url: audio.add(WXXX(encoding=3, desc="Qobuz URL", url=album_url))
+            
+        if cover_bytes:
+            audio.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
+            
+        audio.save(file_path, v2_version=3)
 
 # ─── Status file helpers ───────────────────────────────────────────────────
 _STATUS_FILE = "status.json"
@@ -233,6 +368,7 @@ async def qobuz_get(endpoint: str, params: dict) -> dict:
 class DownloadRequest(BaseModel):
     track_id:   str
     quality:    Literal["mp3", "flac", "hi24", "hi96"] = "flac"
+    target_format: Literal["mp3", "flac", "alac", "wav", "opus"] | None = None
     output_dir: str = "./downloads"
 
 
@@ -241,16 +377,16 @@ class DownloadRequest(BaseModel):
 async def root():
     return {
         "status":    "online",
-        "version":   "1.0.0",
+        "version":   "1.1.0",
         "docs":      "http://localhost:8000/docs",
         "endpoints": [
             "/search", "/track/{id}", "/album/{id}",
             "/artist/{id}", "/download-url/{track_id}",
             "/stream/{track_id}", "/download", "/download-album/{album_id}",
-            "/album-status/{album_id}",
+            "/album-status/{album_id}", 
+            "/export-album/{album_id}"
         ],
     }
-
 
 # ─── Endpoint: Search ──────────────────────────────────────────────────────
 @app.get("/search", tags=["search"])
@@ -478,40 +614,109 @@ async def album_status(
 
 # ─── Internal: single-track background worker ─────────────────────────────
 async def _download_single(req: DownloadRequest, album_dir: str | None = None) -> None:
-    """
-    Downloads one track, honouring the global DOWNLOAD_SEM concurrency limit.
-    URL is fetched inside the semaphore so it is always fresh when the slot opens.
-    If album_dir is provided, updates status.json on completion or failure.
-    """
     async with DOWNLOAD_SEM:
         try:
-            url_data   = await get_download_url(req.track_id, req.quality)
+            url_data = await get_download_url(req.track_id, req.quality)
             track_info = await get_track(req.track_id)
-            title  = track_info.get("title", req.track_id)
-            ext    = "mp3" if req.quality == "mp3" else "flac"
-            fname  = sanitize_filename(
-                f"{track_info.get('track_number', 0):02d} - {title}"
-            ) + f".{ext}"
-            out = os.path.join(req.output_dir, fname)
+            album_info = track_info.get("album", {})
+            
+            title = track_info.get("title", req.track_id)
+            original_ext = "mp3" if req.quality == "mp3" else "flac"
+            final_ext = req.target_format if req.target_format else original_ext
+            
+            base_fname = sanitize_filename(f"{track_info.get('track_number', 0):02d} - {title}")
+            temp_out = os.path.join(req.output_dir, f"{base_fname}.{original_ext}")
+            final_out = os.path.join(req.output_dir, f"{base_fname}.{final_ext}")
+            
+            logger.info(f"[{req.track_id}] Starting: {base_fname}.{final_ext}")
 
-            logger.info(f"[{req.track_id}] Starting: {fname}")
-
-            # [IMPROVEMENT 3] Explicit network error handling
+            # 1. Download file originale
             try:
                 async with http_client.stream("GET", url_data["url"], timeout=None) as r:
-                    with open(out, "wb") as f:
+                    with open(temp_out, "wb") as f:
                         async for chunk in r.aiter_bytes(65536):
                             f.write(chunk)
-                logger.info(f"[{req.track_id}] Done: {fname}")
             except httpx.TimeoutException as e:
                 raise Exception(f"Timeout during file download: {e}")
             except httpx.RequestError as e:
                 raise Exception(f"Network error during file download: {e}")
 
+            # 2. Transcodifica via FFmpeg (se richiesto formato diverso)
+            if original_ext != final_ext:
+                logger.info(f"[{req.track_id}] Transcoding to {final_ext}...")
+                ffmpeg_cmd = ["ffmpeg", "-y", "-i", temp_out]
+                if final_ext == "alac":
+                    ffmpeg_cmd.extend(["-c:a", "alac"])
+                elif final_ext == "wav":
+                    ffmpeg_cmd.extend(["-c:a", "pcm_s16le"])
+                # Puoi aggiungere altri codec come opus qui
+                ffmpeg_cmd.append(final_out)
+                
+                subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                os.remove(temp_out) # Rimuovi l'originale
+            else:
+                final_out = temp_out
+
+            # 3. Download Copertina (Alta risoluzione)
+            cover_bytes = None
+            cover_url = album_info.get("image", {}).get("large")
+            if cover_url:
+                cover_resp = await http_client.get(cover_url)
+                if cover_resp.status_code == 200:
+                    cover_bytes = cover_resp.content
+
+            # 4. Download Lyrics tramite LRCLIB (con sistema di Ricerca/Fallback)
+            plain_lyrics = ""
+            try:
+                artist_name = track_info.get("performer", {}).get("name")
+                if not artist_name:
+                     artist_name = album_info.get("artist", {}).get("name", "")
+                
+                # Puliamo il titolo da diciture come "(Remastered)" per migliorare la ricerca
+                clean_title = title.split(" (")[0]
+                
+                # Tentativo 1: Corrispondenza esatta
+                lrc_resp = await http_client.get("https://lrclib.net/api/get", params={
+                    "track_name": clean_title,
+                    "artist_name": artist_name,
+                    "album_name": album_info.get("title", ""),
+                    "duration": track_info.get("duration", 0)
+                }, timeout=5.0)
+                
+                if lrc_resp.status_code == 200:
+                    plain_lyrics = lrc_resp.json().get("plainLyrics") or ""
+                
+                # Tentativo 2: Fallback tramite funzione di ricerca libera (se il primo fallisce)
+                if not plain_lyrics:
+                    logger.info(f"[{req.track_id}] Match esatto lyrics fallito. Tento la ricerca libera...")
+                    search_resp = await http_client.get("https://lrclib.net/api/search", params={
+                        "track_name": clean_title,
+                        "artist_name": artist_name
+                    }, timeout=5.0)
+                    
+                    if search_resp.status_code == 200:
+                        results = search_resp.json()
+                        # Prendiamo il primo risultato della lista che contiene effettivamente del testo
+                        if isinstance(results, list) and len(results) > 0:
+                            for res in results:
+                                if res.get("plainLyrics"):
+                                    plain_lyrics = res.get("plainLyrics")
+                                    logger.info(f"[{req.track_id}] Lyrics trovate tramite ricerca.")
+                                    break
+
+            except Exception as e:
+                logger.warning(f"[{req.track_id}] Errore di connessione a LRCLIB: {e}")
+
+            # 5. Applica Metadati (con Lyrics!)
+            _apply_metadata(final_out, track_info, album_info, cover_bytes, plain_lyrics)
+
+            logger.info(f"[{req.track_id}] Done: {base_fname}.{final_ext}")
+
+            # Aggiorna status.json
             if album_dir:
                 status = _read_status(album_dir)
                 if req.track_id in status:
-                    status[req.track_id].update({"status": "done", "file": fname})
+                    status[req.track_id].update({"status": "done", "file": f"{base_fname}.{final_ext}"})
                     _write_status(album_dir, status)
 
         except Exception as e:
@@ -522,6 +727,36 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
                     status[req.track_id].update({"status": "error", "error": str(e)})
                     _write_status(album_dir, status)
 
+
+@app.get("/export-album/{album_id}", tags=["download"])
+async def export_album(album_id: str, output_dir: str = Query("./downloads")):
+    """Comprime l'album in un file ZIP e lo restituisce per il download HTTP."""
+    album = await get_album(album_id)
+    artist = album.get("artist", {}).get("name", "Unknown")
+    title = album.get("title", album_id)
+    album_dir = os.path.join(output_dir, sanitize_filename(f"{artist} - {title}"))
+
+    status = _read_status(album_dir)
+    if not status:
+        raise HTTPException(404, "Status file non trovato. Il download non è mai stato avviato.")
+
+    # Controlla se ci sono tracce ancora in fase di download
+    pending = sum(1 for t in status.values() if t["status"] == "pending")
+    if pending > 0:
+        raise HTTPException(400, f"Download in corso: {pending} tracce rimanenti.")
+
+    zip_filename = sanitize_filename(f"{artist} - {title}")
+    zip_path_base = os.path.join(output_dir, zip_filename)
+
+    # Crea l'archivio ZIP in modo sincrono. (Su directory molto grandi può essere spostato in un thread)
+    shutil.make_archive(zip_path_base, 'zip', album_dir)
+    final_zip = f"{zip_path_base}.zip"
+
+    return FileResponse(
+        path=final_zip, 
+        media_type="application/zip", 
+        filename=f"{zip_filename}.zip"
+    )
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
