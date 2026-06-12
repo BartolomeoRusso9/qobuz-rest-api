@@ -40,9 +40,17 @@ logger = logging.getLogger("qobuz-api")
 QOBUZ_BASE = "https://www.qobuz.com/api.json/0.2"
 APP_ID     = os.getenv("QOBUZ_APP_ID", "").strip("'\"")
 SECRET     = os.getenv("QOBUZ_SECRET",  "").strip("'\"")
-_TOKEN     = os.getenv("QOBUZ_TOKEN",   "").strip("'\"")   # overridable via /login
+_TOKEN     = os.getenv("QOBUZ_TOKEN",   "").strip("'\"")   # overridable via /set-token
 
 DEV_MODE = os.getenv("DEV_MODE", "False").lower() in ("true", "1", "yes")
+
+# Proxy residenziale (HTTP, HTTPS o SOCKS5) per bypassare il blocco IP Qobuz
+# su cloud host (Render, Railway, Fly.io, ecc.).
+# Esempi:
+#   http://user:pass@p.webshare.io:80
+#   socks5://user:pass@proxy.example.com:1080
+# Lasciare vuoto per connessione diretta (homelab/locale).
+_PROXY: str | None = os.getenv("QOBUZ_PROXY", "").strip() or None
 
 QUALITY_MAP = {
     "mp3":  5,
@@ -58,12 +66,10 @@ _RATE_LIMIT_MAX_DELAY   = 15.0
 DOWNLOAD_SEM: asyncio.Semaphore   # initialised in lifespan
 http_client: httpx.AsyncClient    # initialised in lifespan
 
-# ─── [NEW] In-memory metadata cache with TTL ──────────────────────────────
-# Avoids redundant Qobuz API calls for the same track/album/artist within
-# the same session.  Default TTL: 10 minutes.  Set CACHE_TTL_SECONDS=0 to disable.
+# ─── In-memory metadata cache with TTL ────────────────────────────────────
 
 _CACHE_TTL   = int(os.getenv("CACHE_TTL_SECONDS", "600"))
-_cache: dict[str, tuple[dict, float]] = {}   # key → (data, expiry_timestamp)
+_cache: dict[str, tuple[dict, float]] = {}
 
 def _cache_get(key: str) -> dict | None:
     if _CACHE_TTL <= 0:
@@ -78,12 +84,11 @@ def _cache_set(key: str, data: dict) -> None:
     if _CACHE_TTL > 0:
         _cache[key] = (data, time.time() + _CACHE_TTL)
 
-# ─── [NEW] Runtime token store (set by /login, falls back to .env) ─────────
+# ─── Runtime token store ───────────────────────────────────────────────────
 
 _runtime_token: str = ""
 
 def _get_token() -> str:
-    """Returns the active token: /login takes precedence over .env."""
     tok = _runtime_token or _TOKEN
     if not tok:
         raise HTTPException(
@@ -102,12 +107,6 @@ def sanitize_filename(name: str) -> str:
 
 
 def _format_filename(template: str, track_info: dict, album_info: dict) -> str:
-    """
-    [NEW] Resolves a filename template with track/album placeholders.
-    Supported tokens: {track}, {title}, {artist}, {album}, {year}, {date},
-                      {disc}, {isrc}, {genre}
-    Example: "{track:02d} - {title}" → "03 - Some Song"
-    """
     artist = (
         track_info.get("performer", {}).get("name")
         or album_info.get("artist", {}).get("name", "Unknown")
@@ -141,7 +140,6 @@ def _apply_metadata(
     cover_bytes: bytes | None,
     lyrics_text: str = "",
 ) -> None:
-    """Injects full Qobuz metadata (including lyrics) into FLAC or MP3."""
     ext = file_path.rsplit(".", 1)[-1].lower()
 
     title        = track_info.get("title", "Unknown")
@@ -280,9 +278,14 @@ async def lifespan(app: FastAPI):
     global http_client, DOWNLOAD_SEM
     if DEV_MODE:
         logger.warning("DEV_MODE enabled — upstream responses will be logged at DEBUG level")
+    if _PROXY:
+        logger.info("Outbound proxy attivo: %s", _PROXY.split("@")[-1])  # nasconde user:pass
+    else:
+        logger.info("Nessun proxy configurato — connessione diretta")
     DOWNLOAD_SEM = asyncio.Semaphore(3)
     http_client  = httpx.AsyncClient(
         http2=True,
+        proxy=_PROXY,   # None = connessione diretta; str = HTTP/HTTPS/SOCKS5 proxy
         timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=30.0),
         limits=httpx.Limits(
             max_keepalive_connections=100,
@@ -301,10 +304,10 @@ app = FastAPI(
         "Local REST API for Qobuz — search, metadata, stream, download and playlist support.\n\n"
         "**Auth:** set `QOBUZ_TOKEN` in `.env`, or call `POST /set-token` at runtime to update "
         "the token without restarting the server.\n\n"
-        "To get your token: log in at [play.qobuz.com](https://play.qobuz.com), open DevTools → "
-        "Application → Local Storage → copy the value of `localuser.token`."
+        "**Proxy:** set `QOBUZ_PROXY` in `.env` to route all Qobuz requests through a residential "
+        "proxy (HTTP, HTTPS o SOCKS5). Necessario quando si ospita su cloud host (Render, ecc.)."
     ),
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -318,7 +321,6 @@ app.add_middleware(
 # ─── Core request helper ───────────────────────────────────────────────────
 
 async def qobuz_get(endpoint: str, params: dict) -> dict:
-    """Authenticated GET with retry/backoff on 429, explicit 401 message and cache support."""
     if not APP_ID or not SECRET:
         raise HTTPException(500, "APP_ID and SECRET not configured in .env.")
 
@@ -365,8 +367,6 @@ async def qobuz_get(endpoint: str, params: dict) -> dict:
         logger.error("Network error on %s: %s", endpoint, e)
         raise HTTPException(503, f"Connection error: {e}")
 
-# Cached wrappers for the most-called endpoints
-
 async def _get_track_cached(track_id: str) -> dict:
     key  = f"track:{track_id}"
     data = _cache_get(key)
@@ -401,7 +401,7 @@ class DownloadRequest(BaseModel):
     quality:         Literal["mp3", "flac", "hi24", "hi96"] = "flac"
     target_format:   Literal["mp3", "flac", "alac", "wav", "opus"] | None = None
     output_dir:      str = "./downloads"
-    filename_format: str = "{track:02d} - {title}"   # [NEW] customisable template
+    filename_format: str = "{track:02d} - {title}"
 
 # ─── Endpoint: Health ──────────────────────────────────────────────────────
 
@@ -409,44 +409,28 @@ class DownloadRequest(BaseModel):
 async def root():
     return {
         "status":  "online",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "docs":    "http://localhost:8000/docs",
         "auth":    "token active" if (_runtime_token or _TOKEN) else "no token — call POST /set-token or set QOBUZ_TOKEN in .env",
+        "proxy":   _PROXY.split("@")[-1] if _PROXY else "direct (no proxy)",
     }
 
 # ─── Endpoint: Set Token ───────────────────────────────────────────────────
 
 @app.post("/set-token", tags=["auth"])
 async def set_token(req: SetTokenRequest):
-    """
-    Updates the active Qobuz user token at runtime without restarting the server
-    or editing .env.
-
-    How to get the token:
-    1. Open https://play.qobuz.com and log in.
-    2. Open DevTools → Application → Local Storage → https://play.qobuz.com.
-    3. Copy the value of the key `localuser.token`.
-    4. POST it here.
-
-    The token is stored in memory for the current session only.
-    To make it permanent, copy it into QOBUZ_TOKEN in your .env.
-    """
     global _runtime_token
-
     token = req.token.strip().strip("'\"")
     if not token:
         raise HTTPException(400, "Token cannot be empty.")
-
     _runtime_token = token
     logger.info("Token updated via POST /set-token")
-
     return {"status": "ok", "token_set": True}
 
-# ─── [NEW] Endpoint: Me ────────────────────────────────────────────────────
+# ─── Endpoint: Me ──────────────────────────────────────────────────────────
 
 @app.get("/me", tags=["auth"])
 async def me():
-    """Returns the authenticated user's profile and subscription plan."""
     data = await qobuz_get("user/get", {"user_id": ""})
     user = data.get("user", data)
     return {
@@ -497,11 +481,10 @@ async def get_artist(
         _cache_set(key, data)
     return data
 
-# ─── [NEW] Endpoint: Playlist ──────────────────────────────────────────────
+# ─── Endpoint: Playlist ────────────────────────────────────────────────────
 
 @app.get("/playlist/{playlist_id}", tags=["metadata"])
 async def get_playlist(playlist_id: str):
-    """Returns playlist metadata and the full track listing."""
     key  = f"playlist:{playlist_id}"
     data = _cache_get(key)
     if data is None:
@@ -514,7 +497,7 @@ async def get_playlist(playlist_id: str):
         _cache_set(key, data)
     return data
 
-# ─── [NEW] Endpoint: Download Playlist ─────────────────────────────────────
+# ─── Endpoint: Download Playlist ───────────────────────────────────────────
 
 @app.post("/download-playlist/{playlist_id}", tags=["download"])
 async def download_playlist(
@@ -524,11 +507,6 @@ async def download_playlist(
     output_dir:      str  = Query("./downloads"),
     filename_format: str  = Query("{track:02d} - {title}"),
 ):
-    """
-    Downloads all tracks from a Qobuz playlist.
-    Tracks are organised in a subfolder named after the playlist.
-    Progress is tracked in status.json (same as /download-album).
-    """
     playlist = await get_playlist(playlist_id)
     tracks   = playlist.get("tracks", {}).get("items", [])
 
@@ -544,7 +522,6 @@ async def download_playlist(
         for t in tracks
     }
     _write_status(pl_dir, status)
-
     logger.info("Playlist download queued: %s (%d tracks)", pl_name, len(tracks))
 
     for track in tracks:
@@ -567,14 +544,13 @@ async def download_playlist(
         "quality":    quality,
     }
 
-# ─── [NEW] Endpoint: Playlist Status ───────────────────────────────────────
+# ─── Endpoint: Playlist Status ─────────────────────────────────────────────
 
 @app.get("/playlist-status/{playlist_id}", tags=["download"])
 async def playlist_status(
     playlist_id: str,
     output_dir:  str = Query("./downloads"),
 ):
-    """Returns the download progress for a playlist (reads status.json)."""
     playlist = await get_playlist(playlist_id)
     pl_name  = playlist.get("name", playlist_id)
     pl_dir   = os.path.join(output_dir, sanitize_filename(pl_name))
@@ -772,7 +748,6 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
 
             logger.info("[%s] Starting: %s.%s", req.track_id, base_fname, final_ext)
 
-            # 1. Download
             try:
                 async with http_client.stream("GET", url_data["url"], timeout=None) as r:
                     with open(temp_out, "wb") as f:
@@ -783,7 +758,6 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
             except httpx.RequestError as e:
                 raise Exception(f"Network error during download: {e}")
 
-            # 2. Transcode (if needed)
             if original_ext != final_ext:
                 ffmpeg_cmd = ["ffmpeg", "-y", "-i", temp_out]
                 if final_ext == "alac":
@@ -798,7 +772,6 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
             else:
                 final_out = temp_out
 
-            # 3. Cover art
             cover_bytes = None
             cover_url   = album_info.get("image", {}).get("large")
             if cover_url:
@@ -806,7 +779,6 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
                 if cr.status_code == 200:
                     cover_bytes = cr.content
 
-            # 4. Lyrics via LRCLIB
             plain_lyrics = ""
             try:
                 artist_name = (
@@ -836,7 +808,6 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
             except Exception as e:
                 logger.warning("[%s] Lyrics fetch failed: %s", req.track_id, e)
 
-            # 5. Metadata
             _apply_metadata(final_out, track_info, album_info, cover_bytes, plain_lyrics)
             logger.info("[%s] Done: %s.%s", req.track_id, base_fname, final_ext)
 
@@ -858,7 +829,6 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
 
 @app.get("/export-album/{album_id}", tags=["download"])
 async def export_album(album_id: str, output_dir: str = Query("./downloads")):
-    """Zips a completed album download and returns it as a file."""
     album  = await _get_album_cached(album_id)
     artist = album.get("artist", {}).get("name", "Unknown")
     title  = album.get("title", album_id)
