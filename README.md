@@ -120,7 +120,7 @@ Returns server status and available endpoints.
 ```json
 {
   "status": "online",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "docs": "http://localhost:8000/docs",
   "endpoints": [
     "/search", "/track/{id}", "/album/{id}",

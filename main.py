@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import time
 import uvicorn
@@ -37,10 +38,20 @@ logger = logging.getLogger("qobuz-api")
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
-QOBUZ_BASE = "https://www.qobuz.com/api.json/0.2"
+QOBUZ_BASE = os.getenv("QOBUZ_API_BASE", "https://www.qobuz.com/api.json/0.2").rstrip("/")
 APP_ID     = os.getenv("QOBUZ_APP_ID", "").strip("'\"")
 SECRET     = os.getenv("QOBUZ_SECRET",  "").strip("'\"")
 _TOKEN     = os.getenv("QOBUZ_TOKEN",   "").strip("'\"")   # overridable via /set-token
+
+_AUTH_TOKENS: list[str] = []
+_raw_tokens = os.getenv("QOBUZ_AUTH_TOKENS", "").strip()
+if _raw_tokens:
+    try:
+        tokens = json.loads(_raw_tokens)
+        if isinstance(tokens, list):
+            _AUTH_TOKENS = [str(t).strip("'\"") for t in tokens if str(t).strip()]
+    except json.JSONDecodeError:
+        _AUTH_TOKENS = [t.strip("'\"") for t in _raw_tokens.split(",") if t.strip()]
 
 DEV_MODE = os.getenv("DEV_MODE", "False").lower() in ("true", "1", "yes")
 
@@ -51,6 +62,11 @@ DEV_MODE = os.getenv("DEV_MODE", "False").lower() in ("true", "1", "yes")
 #   socks5://user:pass@proxy.example.com:1080
 # Lasciare vuoto per connessione diretta (homelab/locale).
 _PROXY: str | None = os.getenv("QOBUZ_PROXY", "").strip() or None
+
+DEFAULT_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+}
 
 QUALITY_MAP = {
     "mp3":  5,
@@ -89,13 +105,19 @@ def _cache_set(key: str, data: dict) -> None:
 _runtime_token: str = ""
 
 def _get_token() -> str:
-    tok = _runtime_token or _TOKEN
-    if not tok:
-        raise HTTPException(
-            401,
-            "No token available.  Call POST /set-token or set QOBUZ_TOKEN in .env.",
-        )
-    return tok
+    if _runtime_token:
+        logger.info("Using runtime token set via POST /set-token")
+        return _runtime_token
+    if _TOKEN:
+        logger.info("Using token from QOBUZ_TOKEN environment variable")
+        return _TOKEN
+    if _AUTH_TOKENS:
+        logger.info("Using one of %d auth tokens from QOBUZ_AUTH_TOKENS", len(_AUTH_TOKENS))
+        return random.choice(_AUTH_TOKENS)
+    raise HTTPException(
+        401,
+        "No token available. Call POST /set-token, set QOBUZ_TOKEN in .env, or define QOBUZ_AUTH_TOKENS.",
+    )
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -276,6 +298,11 @@ def _log_response(method: str, url: str, resp: httpx.Response) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client, DOWNLOAD_SEM
+    logger.info("Qobuz API base: %s", QOBUZ_BASE)
+    logger.info("APP_ID configured: %s", "yes" if APP_ID else "no")
+    logger.info("SECRET configured: %s", "yes" if SECRET else "no")
+    logger.info("Token sources: runtime=%s, QOBUZ_TOKEN=%s, QOBUZ_AUTH_TOKENS=%d",
+                bool(_runtime_token), bool(_TOKEN), len(_AUTH_TOKENS))
     if DEV_MODE:
         logger.warning("DEV_MODE enabled — upstream responses will be logged at DEBUG level")
     if _PROXY:
@@ -286,6 +313,8 @@ async def lifespan(app: FastAPI):
     http_client  = httpx.AsyncClient(
         http2=True,
         proxy=_PROXY,   # None = connessione diretta; str = HTTP/HTTPS/SOCKS5 proxy
+        trust_env=False,  # ignore system HTTP_PROXY/HTTPS_PROXY when proxy isn't explicitly configured
+        headers=DEFAULT_HEADERS,
         timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=30.0),
         limits=httpx.Limits(
             max_keepalive_connections=100,
@@ -328,6 +357,8 @@ async def qobuz_get(endpoint: str, params: dict) -> dict:
     url    = f"{QOBUZ_BASE}/{endpoint}"
 
     try:
+        safe_params = {k: v for k, v in params.items() if k != "user_auth_token"}
+        logger.debug("Qobuz request: %s %s params=%s", endpoint, url, safe_params)
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
             r = await http_client.get(url, params=params)
             _log_response("GET", url, r)
@@ -411,8 +442,9 @@ async def root():
         "status":  "online",
         "version": "2.1.0",
         "docs":    "http://localhost:8000/docs",
-        "auth":    "token active" if (_runtime_token or _TOKEN) else "no token — call POST /set-token or set QOBUZ_TOKEN in .env",
+        "auth":    "token active" if (_runtime_token or _TOKEN or _AUTH_TOKENS) else "no token — call POST /set-token or set QOBUZ_TOKEN in .env",
         "proxy":   _PROXY.split("@")[-1] if _PROXY else "direct (no proxy)",
+        "qobuz_api_base": QOBUZ_BASE,
     }
 
 # ─── Endpoint: Set Token ───────────────────────────────────────────────────
@@ -614,6 +646,9 @@ async def stream_track(
     async def generate():
         try:
             async with http_client.stream("GET", url_data["url"], timeout=None) as r:
+                if r.status_code != 200:
+                    body = await r.aread()
+                    raise HTTPException(r.status_code, f"Stream failed: {body[:200]!r}")
                 async for chunk in r.aiter_bytes(65536):
                     yield chunk
         except httpx.TimeoutException:
@@ -628,37 +663,22 @@ async def stream_track(
 
 @app.post("/download", tags=["download"])
 async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks):
-    url_data   = await get_download_url(req.track_id, req.quality)
     track_info = await _get_track_cached(req.track_id)
     album_info = track_info.get("album", {})
-    ext        = "mp3" if req.quality == "mp3" else "flac"
-    fname      = _format_filename(req.filename_format, track_info, album_info) + f".{ext}"
+    original_ext = "mp3" if req.quality == "mp3" else "flac"
+    final_ext    = req.target_format or original_ext
+    fname        = _format_filename(req.filename_format, track_info, album_info) + f".{final_ext}"
     os.makedirs(req.output_dir, exist_ok=True)
-    out_path   = os.path.join(req.output_dir, fname)
+    out_path = os.path.join(req.output_dir, fname)
 
-    async def do_download():
-        async with DOWNLOAD_SEM:
-            logger.info("[%s] Starting: %s", req.track_id, fname)
-            try:
-                async with http_client.stream("GET", url_data["url"], timeout=None) as r:
-                    with open(out_path, "wb") as f:
-                        async for chunk in r.aiter_bytes(65536):
-                            f.write(chunk)
-                logger.info("[%s] Done: %s", req.track_id, fname)
-            except httpx.TimeoutException:
-                logger.error("[%s] Timeout", req.track_id)
-            except httpx.RequestError as e:
-                logger.error("[%s] Network error: %s", req.track_id, e)
-            except Exception as e:
-                logger.error("[%s] Failed: %s", req.track_id, e)
-
-    background_tasks.add_task(do_download)
+    background_tasks.add_task(_download_single, req, None)
     return {
         "status":   "downloading",
         "track_id": req.track_id,
         "filename": fname,
         "output":   out_path,
         "quality":  req.quality,
+        "format":   final_ext,
     }
 
 # ─── Endpoint: Download album ──────────────────────────────────────────────
@@ -750,6 +770,11 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
 
             try:
                 async with http_client.stream("GET", url_data["url"], timeout=None) as r:
+                    if r.status_code != 200:
+                        body = await r.aread()
+                        raise Exception(
+                            f"Download failed: {r.status_code} {body[:200]!r}"
+                        )
                     with open(temp_out, "wb") as f:
                         async for chunk in r.aiter_bytes(65536):
                             f.write(chunk)
