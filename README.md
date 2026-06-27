@@ -1,4 +1,4 @@
-# qobuz-api
+# qobuz-rest-api
 
 > [!IMPORTANT]
 > Music piracy is illegal in most countries. This project is intended for use with a valid Qobuz subscription for personal/educational purposes (e.g. in your homelab). Use responsibly.
