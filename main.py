@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 import httpx
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -53,7 +53,28 @@ if _raw_tokens:
     except json.JSONDecodeError:
         _AUTH_TOKENS = [t.strip("'\"") for t in _raw_tokens.split(",") if t.strip()]
 
+# Tokens that recently returned 401 are skipped by the round-robin picker
+# until the cooldown expires, so a pool with one dead token doesn't keep
+# getting re-selected by random.choice().
+_TOKEN_COOLDOWN_SECONDS = 300
+_dead_tokens: dict[str, float] = {}
+
 DEV_MODE = os.getenv("DEV_MODE", "False").lower() in ("true", "1", "yes")
+
+# API key required on every request (except /docs, /openapi.json, /redoc).
+# Leave empty to disable auth (NOT recommended if the port is reachable
+# from outside localhost).
+API_KEY = os.getenv("API_KEY", "").strip("'\"")
+
+# Comma-separated list of allowed CORS origins. Defaults to none (same-origin
+# only) instead of "*" — set explicitly if you need browser access from
+# another origin.
+_raw_origins = os.getenv("CORS_ORIGINS", "").strip()
+CORS_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+# Root directory downloads are confined to. output_dir given by clients is
+# resolved relative to this and rejected if it would escape it.
+DOWNLOAD_ROOT = os.path.realpath(os.getenv("DOWNLOAD_ROOT", "./downloads"))
 
 # Proxy residenziale (HTTP, HTTPS o SOCKS5) per bypassare il blocco IP Qobuz
 # su cloud host (Render, Railway, Fly.io, ecc.).
@@ -100,9 +121,27 @@ def _cache_set(key: str, data: dict) -> None:
     if _CACHE_TTL > 0:
         _cache[key] = (data, time.time() + _CACHE_TTL)
 
+def _cache_clear() -> int:
+    n = len(_cache)
+    _cache.clear()
+    return n
+
 # ─── Runtime token store ───────────────────────────────────────────────────
 
 _runtime_token: str = ""
+
+def _is_dead(token: str) -> bool:
+    expiry = _dead_tokens.get(token)
+    if expiry is None:
+        return False
+    if time.time() >= expiry:
+        _dead_tokens.pop(token, None)
+        return False
+    return True
+
+def _mark_dead(token: str) -> None:
+    if token:
+        _dead_tokens[token] = time.time() + _TOKEN_COOLDOWN_SECONDS
 
 def _get_token() -> str:
     if _runtime_token:
@@ -112,8 +151,10 @@ def _get_token() -> str:
         logger.info("Using token from QOBUZ_TOKEN environment variable")
         return _TOKEN
     if _AUTH_TOKENS:
-        logger.info("Using one of %d auth tokens from QOBUZ_AUTH_TOKENS", len(_AUTH_TOKENS))
-        return random.choice(_AUTH_TOKENS)
+        candidates = [t for t in _AUTH_TOKENS if not _is_dead(t)] or _AUTH_TOKENS
+        logger.info("Using one of %d/%d live auth tokens from QOBUZ_AUTH_TOKENS",
+                     len(candidates), len(_AUTH_TOKENS))
+        return random.choice(candidates)
     raise HTTPException(
         401,
         "No token available. Call POST /set-token, set QOBUZ_TOKEN in .env, or define QOBUZ_AUTH_TOKENS.",
@@ -126,6 +167,17 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r"-{2,}", "-", name)
     name = re.sub(r" {2,}", " ", name)
     return name.strip(" -")
+
+
+def resolve_output_dir(requested: str) -> str:
+    """Resolve a client-supplied output_dir against DOWNLOAD_ROOT and reject
+    any path (via '..', absolute paths, or symlinks) that would escape it.
+    """
+    requested = requested or "."
+    candidate = os.path.realpath(os.path.join(DOWNLOAD_ROOT, requested.lstrip("/\\")))
+    if candidate != DOWNLOAD_ROOT and not candidate.startswith(DOWNLOAD_ROOT + os.sep):
+        raise HTTPException(400, "Invalid output_dir: must resolve inside the download root.")
+    return candidate
 
 
 def _format_filename(template: str, track_info: dict, album_info: dict) -> str:
@@ -303,6 +355,10 @@ async def lifespan(app: FastAPI):
     logger.info("SECRET configured: %s", "yes" if SECRET else "no")
     logger.info("Token sources: runtime=%s, QOBUZ_TOKEN=%s, QOBUZ_AUTH_TOKENS=%d",
                 bool(_runtime_token), bool(_TOKEN), len(_AUTH_TOKENS))
+    logger.info("API_KEY auth: %s", "enabled" if API_KEY else "DISABLED (no API_KEY set)")
+    logger.info("CORS origins: %s", CORS_ORIGINS or "none (same-origin only)")
+    logger.info("Download root: %s", DOWNLOAD_ROOT)
+    os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
     if DEV_MODE:
         logger.warning("DEV_MODE enabled — upstream responses will be logged at DEBUG level")
     if _PROXY:
@@ -336,16 +392,30 @@ app = FastAPI(
         "**Proxy:** set `QOBUZ_PROXY` in `.env` to route all Qobuz requests through a residential "
         "proxy (HTTP, HTTPS o SOCKS5). Necessario quando si ospita su cloud host (Render, ecc.)."
     ),
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ORIGINS,           # empty by default = no cross-origin browser access
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
+
+# ─── Auth middleware ────────────────────────────────────────────────────────
+
+_PUBLIC_PATHS = {"/", "/docs", "/openapi.json", "/redoc"}
+
+@app.middleware("http")
+async def api_key_guard(request: Request, call_next):
+    if API_KEY and request.url.path not in _PUBLIC_PATHS:
+        supplied = request.headers.get("X-API-Key", "")
+        if supplied != API_KEY:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=401, content={"detail": "Missing or invalid X-API-Key header."})
+    return await call_next(request)
 
 # ─── Core request helper ───────────────────────────────────────────────────
 
@@ -353,7 +423,8 @@ async def qobuz_get(endpoint: str, params: dict) -> dict:
     if not APP_ID or not SECRET:
         raise HTTPException(500, "APP_ID and SECRET not configured in .env.")
 
-    params = {**params, "app_id": APP_ID, "user_auth_token": _get_token()}
+    token = _get_token()
+    params = {**params, "app_id": APP_ID, "user_auth_token": token}
     url    = f"{QOBUZ_BASE}/{endpoint}"
 
     try:
@@ -364,6 +435,7 @@ async def qobuz_get(endpoint: str, params: dict) -> dict:
             _log_response("GET", url, r)
 
             if r.status_code == 401:
+                _mark_dead(token)
                 raise HTTPException(
                     401,
                     "Token invalid or expired.  "
@@ -440,9 +512,10 @@ class DownloadRequest(BaseModel):
 async def root():
     return {
         "status":  "online",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "docs":    "http://localhost:8000/docs",
         "auth":    "token active" if (_runtime_token or _TOKEN or _AUTH_TOKENS) else "no token — call POST /set-token or set QOBUZ_TOKEN in .env",
+        "api_key_required": bool(API_KEY),
         "proxy":   _PROXY.split("@")[-1] if _PROXY else "direct (no proxy)",
         "qobuz_api_base": QOBUZ_BASE,
     }
@@ -472,6 +545,14 @@ async def me():
         "plan":    user.get("credential", {}).get("label"),
         "country": user.get("country_code"),
     }
+
+# ─── Endpoint: Cache management ────────────────────────────────────────────
+
+@app.post("/cache/clear", tags=["info"])
+async def cache_clear():
+    n = _cache_clear()
+    logger.info("Cache cleared (%d entries removed)", n)
+    return {"status": "ok", "entries_removed": n}
 
 # ─── Endpoint: Search ──────────────────────────────────────────────────────
 
@@ -546,7 +627,8 @@ async def download_playlist(
         raise HTTPException(404, "No tracks found in the playlist.")
 
     pl_name    = playlist.get("name", playlist_id)
-    pl_dir     = os.path.join(output_dir, sanitize_filename(pl_name))
+    resolved_root = resolve_output_dir(output_dir)
+    pl_dir     = os.path.join(resolved_root, sanitize_filename(pl_name))
     os.makedirs(pl_dir, exist_ok=True)
 
     status = {
@@ -555,6 +637,10 @@ async def download_playlist(
     }
     _write_status(pl_dir, status)
     logger.info("Playlist download queued: %s (%d tracks)", pl_name, len(tracks))
+
+    # Fetch the cover once and share it across all tracks in this playlist,
+    # rather than re-downloading it per track.
+    shared_cover: dict[str, bytes | None] = {}
 
     for track in tracks:
         background_tasks.add_task(
@@ -566,6 +652,7 @@ async def download_playlist(
                 filename_format=filename_format,
             ),
             pl_dir,
+            shared_cover,
         )
 
     return {
@@ -585,7 +672,7 @@ async def playlist_status(
 ):
     playlist = await get_playlist(playlist_id)
     pl_name  = playlist.get("name", playlist_id)
-    pl_dir   = os.path.join(output_dir, sanitize_filename(pl_name))
+    pl_dir   = os.path.join(resolve_output_dir(output_dir), sanitize_filename(pl_name))
     status   = _read_status(pl_dir)
     if not status:
         raise HTTPException(404, "No status file found — has the download been started?")
@@ -668,10 +755,12 @@ async def download_track(req: DownloadRequest, background_tasks: BackgroundTasks
     original_ext = "mp3" if req.quality == "mp3" else "flac"
     final_ext    = req.target_format or original_ext
     fname        = _format_filename(req.filename_format, track_info, album_info) + f".{final_ext}"
-    os.makedirs(req.output_dir, exist_ok=True)
-    out_path = os.path.join(req.output_dir, fname)
+    resolved_dir = resolve_output_dir(req.output_dir)
+    os.makedirs(resolved_dir, exist_ok=True)
+    out_path = os.path.join(resolved_dir, fname)
 
-    background_tasks.add_task(_download_single, req, None)
+    resolved_req = req.model_copy(update={"output_dir": resolved_dir})
+    background_tasks.add_task(_download_single, resolved_req, None)
     return {
         "status":   "downloading",
         "track_id": req.track_id,
@@ -698,7 +787,8 @@ async def download_album(
 
     artist_name = album.get("artist", {}).get("name", "Unknown")
     album_title = album.get("title", album_id)
-    album_dir   = os.path.join(output_dir, sanitize_filename(f"{artist_name} - {album_title}"))
+    resolved_root = resolve_output_dir(output_dir)
+    album_dir   = os.path.join(resolved_root, sanitize_filename(f"{artist_name} - {album_title}"))
     os.makedirs(album_dir, exist_ok=True)
 
     status = {
@@ -707,6 +797,10 @@ async def download_album(
     }
     _write_status(album_dir, status)
     logger.info("Album download queued: %s — %s (%d tracks)", artist_name, album_title, len(tracks))
+
+    # Shared dict so the cover art is fetched once per album instead of once
+    # per track — populated by the first worker task that reaches it.
+    shared_cover: dict[str, bytes | None] = {}
 
     for track in tracks:
         background_tasks.add_task(
@@ -718,6 +812,7 @@ async def download_album(
                 filename_format=filename_format,
             ),
             album_dir,
+            shared_cover,
         )
 
     return {
@@ -736,7 +831,7 @@ async def album_status(album_id: str, output_dir: str = Query("./downloads")):
     album  = await _get_album_cached(album_id)
     artist = album.get("artist", {}).get("name", "Unknown")
     title  = album.get("title", album_id)
-    status = _read_status(os.path.join(output_dir, sanitize_filename(f"{artist} - {title}")))
+    status = _read_status(os.path.join(resolve_output_dir(output_dir), sanitize_filename(f"{artist} - {title}")))
     if not status:
         raise HTTPException(404, "Status file not found — has the download been started?")
     done    = sum(1 for t in status.values() if t["status"] == "done")
@@ -751,10 +846,43 @@ async def album_status(album_id: str, output_dir: str = Query("./downloads")):
         "tracks":  status,
     }
 
+# ─── Endpoint: list all known downloads ────────────────────────────────────
+
+@app.get("/downloads", tags=["download"])
+async def list_downloads(output_dir: str = Query("./downloads")):
+    """Scan the download root for status.json files and summarize progress
+    for each one, so clients don't need to remember exact artist/album or
+    playlist names to check on things."""
+    root = resolve_output_dir(output_dir)
+    results = []
+    if os.path.isdir(root):
+        for entry in sorted(os.listdir(root)):
+            folder = os.path.join(root, entry)
+            status = _read_status(folder)
+            if not status:
+                continue
+            done    = sum(1 for t in status.values() if t["status"] == "done")
+            errors  = sum(1 for t in status.values() if t["status"] == "error")
+            pending = sum(1 for t in status.values() if t["status"] == "pending")
+            results.append({
+                "name": entry,
+                "path": folder,
+                "done": done,
+                "pending": pending,
+                "errors": errors,
+                "total": len(status),
+            })
+    return {"output_dir": root, "items": results}
+
 # ─── Internal: single-track worker ─────────────────────────────────────────
 
-async def _download_single(req: DownloadRequest, album_dir: str | None = None) -> None:
+async def _download_single(
+    req: DownloadRequest,
+    album_dir: str | None = None,
+    shared_cover: dict[str, bytes | None] | None = None,
+) -> None:
     async with DOWNLOAD_SEM:
+        temp_out: str | None = None
         try:
             url_data   = await get_download_url(req.track_id, req.quality)
             track_info = await _get_track_cached(req.track_id)
@@ -792,17 +920,29 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
                 elif final_ext == "opus":
                     ffmpeg_cmd.extend(["-c:a", "libopus", "-b:a", "192k"])
                 ffmpeg_cmd.append(final_out)
-                subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                os.remove(temp_out)
+                try:
+                    subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                finally:
+                    # Always remove the intermediate file, even if ffmpeg failed,
+                    # so no orphaned raw audio is left behind.
+                    if os.path.exists(temp_out):
+                        os.remove(temp_out)
             else:
                 final_out = temp_out
+            temp_out = None  # fully handled from here on
 
+            # Cover art: reuse a shared, already-fetched copy when downloading
+            # a whole album/playlist instead of re-fetching per track.
             cover_bytes = None
             cover_url   = album_info.get("image", {}).get("large")
-            if cover_url:
+            if shared_cover is not None and cover_url in shared_cover:
+                cover_bytes = shared_cover[cover_url]
+            elif cover_url:
                 cr = await http_client.get(cover_url)
                 if cr.status_code == 200:
                     cover_bytes = cr.content
+                if shared_cover is not None:
+                    shared_cover[cover_url] = cover_bytes
 
             plain_lyrics = ""
             try:
@@ -844,6 +984,13 @@ async def _download_single(req: DownloadRequest, album_dir: str | None = None) -
 
         except Exception as e:
             logger.error("[%s] Failed: %s", req.track_id, e)
+            # Clean up a dangling intermediate file left by a failed conversion
+            # or a partial download.
+            if temp_out and os.path.exists(temp_out):
+                try:
+                    os.remove(temp_out)
+                except OSError:
+                    pass
             if album_dir:
                 s = _read_status(album_dir)
                 if req.track_id in s:
@@ -857,14 +1004,15 @@ async def export_album(album_id: str, output_dir: str = Query("./downloads")):
     album  = await _get_album_cached(album_id)
     artist = album.get("artist", {}).get("name", "Unknown")
     title  = album.get("title", album_id)
-    album_dir   = os.path.join(output_dir, sanitize_filename(f"{artist} - {title}"))
+    resolved_root = resolve_output_dir(output_dir)
+    album_dir   = os.path.join(resolved_root, sanitize_filename(f"{artist} - {title}"))
     status      = _read_status(album_dir)
     if not status:
         raise HTTPException(404, "Status file not found — download not started?")
     pending = sum(1 for t in status.values() if t["status"] == "pending")
     if pending > 0:
         raise HTTPException(400, f"Download in progress: {pending} track(s) remaining.")
-    zip_base = os.path.join(output_dir, sanitize_filename(f"{artist} - {title}"))
+    zip_base = os.path.join(resolved_root, sanitize_filename(f"{artist} - {title}"))
     shutil.make_archive(zip_base, "zip", album_dir)
     return FileResponse(
         path=f"{zip_base}.zip",

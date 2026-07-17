@@ -20,15 +20,21 @@ cp .env.example .env
 | `QOBUZ_APP_ID`        | Qobuz App ID — see [Finding APP\_ID and SECRET](#finding-app_id-and-secret)                                                      |
 | `QOBUZ_SECRET`        | Qobuz Secret — see [Finding APP\_ID and SECRET](#finding-app_id-and-secret)                                                      |
 | `QOBUZ_TOKEN`         | User token → localStorage of [play.qobuz.com](https://play.qobuz.com), key `localuser.token`                                    |
-| `QOBUZ_AUTH_TOKENS`   | Pool of multiple tokens as a JSON array or comma-separated string — one is picked at random per request                          |
+| `QOBUZ_AUTH_TOKENS`   | Pool of multiple tokens as a JSON array or comma-separated string — one is picked at random per request, skipping tokens that recently returned `401` |
 | `QOBUZ_API_BASE`      | Alternative Qobuz API base URL (default: `https://www.qobuz.com/api.json/0.2`)                                                   |
 | `QOBUZ_PROXY`         | Residential proxy for cloud hosting — `http://user:pass@host:port` or `socks5://user:pass@host:port`. Leave empty for direct.   |
+| `API_KEY`             | If set, every request except `/`, `/docs`, `/openapi.json`, `/redoc` must include header `X-API-Key: <value>`. **Strongly recommended** if the port is reachable from outside localhost. Generate with `openssl rand -hex 32`. |
+| `CORS_ORIGINS`        | Comma-separated list of allowed browser origins. Empty (default) disables cross-origin browser access entirely.                 |
+| `DOWNLOAD_ROOT`       | Root directory all `output_dir` values are confined to (default: `./downloads`). Requests attempting to escape it (`../`, absolute paths) are rejected with `400`. |
 | `LOG_LEVEL`           | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`)                                                            |
 | `DEV_MODE`            | Set to `true` to log full upstream responses at DEBUG level                                                                      |
 | `CACHE_TTL_SECONDS`   | TTL in seconds for the in-memory metadata cache (default: `600`). Set to `0` to disable.                                        |
 
 > [!IMPORTANT]
 > `QOBUZ_APP_ID` and `QOBUZ_SECRET` must be set manually. APP_ID and SECRET are a matched pair — using mismatched values will cause `400 Invalid Request Signature` errors on all download endpoints.
+
+> [!WARNING]
+> This server has no authentication by default. If you expose port 8000 beyond `127.0.0.1` (e.g. on a homelab reachable from your LAN, or a cloud host), set `API_KEY` in `.env` and pass it as the `X-API-Key` header on every request. The bundled `docker-compose.yml` binds to `127.0.0.1:8000` for this reason — change it deliberately if you need broader access.
 
 Start the server with:
 
@@ -56,8 +62,9 @@ Run with your token:
 
 ```
 docker run -d \
-  -p 8000:8000 \
+  -p 127.0.0.1:8000:8000 \
   -e QOBUZ_TOKEN=your_token_here \
+  -e API_KEY=your_generated_api_key \
   -e LOG_LEVEL=INFO \
   ghcr.io/bartolomeorusso9/qobuz-api:main
 ```
@@ -66,7 +73,7 @@ Or with a `.env` file:
 
 ```
 docker run -d \
-  -p 8000:8000 \
+  -p 127.0.0.1:8000:8000 \
   --env-file .env \
   ghcr.io/bartolomeorusso9/qobuz-api:main
 ```
@@ -117,9 +124,12 @@ Try each APP_ID candidate with the first SECRET until `/download-url/{track_id}`
 
 ## API Schema
 
+> [!NOTE]
+> If `API_KEY` is set in `.env`, every request below (except `GET /`, `/docs`, `/openapi.json`, `/redoc`) must include header `X-API-Key: <your key>`. Omitted from the examples below for brevity.
+
 ### `GET /`
 
-Returns server status, auth state, proxy config and the API base in use.
+Returns server status, auth state, proxy config and the API base in use. Always public, even when `API_KEY` is set.
 
 #### Response
 
@@ -128,9 +138,10 @@ Returns server status, auth state, proxy config and the API base in use.
 ```json
 {
   "status": "online",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "docs": "http://localhost:8000/docs",
   "auth": "token active",
+  "api_key_required": true,
   "proxy": "direct (no proxy)",
   "qobuz_api_base": "https://www.qobuz.com/api.json/0.2"
 }
@@ -154,6 +165,20 @@ Updates the active token at runtime without restarting the server. The new token
 
 ```json
 { "status": "ok", "token_set": true }
+```
+
+---
+
+### `POST /cache/clear`
+
+Clears the in-memory metadata cache (tracks, albums, artists, playlists) immediately, without waiting for TTL expiry.
+
+#### Response
+
+`200 OK`
+
+```json
+{ "status": "ok", "entries_removed": 12 }
 ```
 
 ---
@@ -509,11 +534,11 @@ Downloads a track to disk in the background. Returns immediately.
 ```
 
 | Field             | Type   | Default                 | Description                                                   |
-| ----------------- | ------ | ----------------------- | ------------------------------------------------------------- |
+| ----------------- | ------ | ------------------------ | --------------------------------------------------------------|
 | `track_id`        | `str`  | required                | Qobuz track ID                                                |
 | `quality`         | `str`  | `flac`                  | Source quality: `mp3`, `flac`, `hi24`, `hi96`                 |
 | `target_format`   | `str`  | same as `quality`       | Output format: `mp3`, `flac`, `alac`, `wav`, `opus` — requires `ffmpeg` for conversion |
-| `output_dir`      | `str`  | `./downloads`           | Directory where the file will be saved                        |
+| `output_dir`      | `str`  | `./downloads`           | Directory where the file will be saved, resolved relative to `DOWNLOAD_ROOT`. Paths attempting to escape it are rejected. |
 | `filename_format` | `str`  | `{track:02d} - {title}` | Filename template — see [Filename format](#filename-format)   |
 
 #### Response
@@ -538,7 +563,7 @@ Downloads a track to disk in the background. Returns immediately.
 
 ### `POST /download-album/{album_id}`
 
-Downloads all tracks from an album to disk in the background. Returns immediately. At most **3 tracks** are downloaded concurrently; remaining tracks are queued automatically.
+Downloads all tracks from an album to disk in the background. Returns immediately. At most **3 tracks** are downloaded concurrently; remaining tracks are queued automatically. The album cover is fetched once and reused across all tracks.
 
 #### Params
 
@@ -610,9 +635,37 @@ curl "http://localhost:8000/album-status/em5pzj2fxalfl?output_dir=./music"
 
 ---
 
+### `GET /downloads`
+
+Lists every download tracked under `output_dir` (albums and playlists) along with a quick progress summary, without needing to know exact artist/album/playlist names.
+
+```
+curl "http://localhost:8000/downloads?output_dir=./music"
+```
+
+#### Params
+
+- `output_dir`: `str` (optional, default `./downloads`)
+
+#### Response
+
+`200 OK`
+
+```json
+{
+  "output_dir": "/app/downloads",
+  "items": [
+    { "name": "Francesco Cavestri - Noè", "path": "/app/downloads/Francesco Cavestri - Noè", "done": 10, "pending": 0, "errors": 0, "total": 10 },
+    { "name": "My Playlist", "path": "/app/downloads/My Playlist", "done": 20, "pending": 4, "errors": 1, "total": 25 }
+  ]
+}
+```
+
+---
+
 ### `POST /download-playlist/{playlist_id}`
 
-Downloads all tracks from a Qobuz playlist to disk in the background. Returns immediately. Respects the same 3-track concurrency limit as album downloads.
+Downloads all tracks from a Qobuz playlist to disk in the background. Returns immediately. Respects the same 3-track concurrency limit as album downloads, and reuses a single fetch of each track's cover art where possible.
 
 #### Params
 
@@ -728,18 +781,19 @@ Examples:
 import requests
 
 BASE = "http://localhost:8000"
+HEADERS = {"X-API-Key": "your_generated_api_key"}  # omit if API_KEY isn't set
 
 # Update token at runtime
-requests.post(f"{BASE}/set-token", json={"token": "your_fresh_token"})
+requests.post(f"{BASE}/set-token", json={"token": "your_fresh_token"}, headers=HEADERS)
 
 # Check authenticated user
-me = requests.get(f"{BASE}/me").json()
+me = requests.get(f"{BASE}/me", headers=HEADERS).json()
 
 # Search for an album
-results = requests.get(f"{BASE}/search", params={"q": "Francesco Cavestri", "type": "albums"}).json()
+results = requests.get(f"{BASE}/search", params={"q": "Francesco Cavestri", "type": "albums"}, headers=HEADERS).json()
 
 # Get a signed download URL
-url_info = requests.get(f"{BASE}/download-url/420232043", params={"quality": "hi24"}).json()
+url_info = requests.get(f"{BASE}/download-url/420232043", params={"quality": "hi24"}, headers=HEADERS).json()
 print(url_info["url"])  # pass directly to ffmpeg or httpx
 
 # Download a single track with format conversion
@@ -749,54 +803,58 @@ requests.post(f"{BASE}/download", json={
     "target_format": "alac",
     "output_dir": "./music",
     "filename_format": "{track:02d} - {title}",
-})
+}, headers=HEADERS)
 
 # Download a full album
 requests.post(f"{BASE}/download-album/em5pzj2fxalfl", params={
     "quality": "hi24",
     "output_dir": "./music",
-})
+}, headers=HEADERS)
 
 # Poll album download status
-status = requests.get(f"{BASE}/album-status/em5pzj2fxalfl", params={"output_dir": "./music"}).json()
+status = requests.get(f"{BASE}/album-status/em5pzj2fxalfl", params={"output_dir": "./music"}, headers=HEADERS).json()
 print(f"{status['done']}/{status['done'] + status['pending']} tracks done")
 ```
 
 ### curl
 
 ```bash
-# Check status and auth
+# Check status and auth (always public)
 curl "http://localhost:8000/"
+
+# All other requests need -H "X-API-Key: your_generated_api_key" if API_KEY is set
 
 # Set token at runtime
 curl -X POST http://localhost:8000/set-token \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: your_generated_api_key" \
   -d '{"token":"your_fresh_token"}'
 
 # Authenticated user info
-curl "http://localhost:8000/me"
+curl "http://localhost:8000/me" -H "X-API-Key: your_generated_api_key"
 
 # Search
-curl "http://localhost:8000/search?q=Francesco+Cavestri&type=albums"
+curl "http://localhost:8000/search?q=Francesco+Cavestri&type=albums" -H "X-API-Key: your_generated_api_key"
 
 # Track metadata
-curl "http://localhost:8000/track/420232043"
+curl "http://localhost:8000/track/420232043" -H "X-API-Key: your_generated_api_key"
 
 # Album metadata
-curl "http://localhost:8000/album/em5pzj2fxalfl"
+curl "http://localhost:8000/album/em5pzj2fxalfl" -H "X-API-Key: your_generated_api_key"
 
 # Artist with albums
-curl "http://localhost:8000/artist/12951852?limit=20"
+curl "http://localhost:8000/artist/12951852?limit=20" -H "X-API-Key: your_generated_api_key"
 
 # Playlist metadata
-curl "http://localhost:8000/playlist/12345678"
+curl "http://localhost:8000/playlist/12345678" -H "X-API-Key: your_generated_api_key"
 
 # Download URL
-curl "http://localhost:8000/download-url/420232043?quality=hi24"
+curl "http://localhost:8000/download-url/420232043?quality=hi24" -H "X-API-Key: your_generated_api_key"
 
 # Download track to disk (with custom filename template and format conversion)
 curl -X POST http://localhost:8000/download \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: your_generated_api_key" \
   -d '{
     "track_id": "420232043",
     "quality": "hi24",
@@ -806,18 +864,27 @@ curl -X POST http://localhost:8000/download \
   }'
 
 # Download full album to disk
-curl -X POST "http://localhost:8000/download-album/em5pzj2fxalfl?quality=hi24&output_dir=./music"
+curl -X POST "http://localhost:8000/download-album/em5pzj2fxalfl?quality=hi24&output_dir=./music" \
+  -H "X-API-Key: your_generated_api_key"
 
 # Check album download progress
-curl "http://localhost:8000/album-status/em5pzj2fxalfl?output_dir=./music"
+curl "http://localhost:8000/album-status/em5pzj2fxalfl?output_dir=./music" -H "X-API-Key: your_generated_api_key"
+
+# List all tracked downloads
+curl "http://localhost:8000/downloads?output_dir=./music" -H "X-API-Key: your_generated_api_key"
 
 # Download full playlist to disk
-curl -X POST "http://localhost:8000/download-playlist/12345678?quality=flac&output_dir=./music"
+curl -X POST "http://localhost:8000/download-playlist/12345678?quality=flac&output_dir=./music" \
+  -H "X-API-Key: your_generated_api_key"
 
 # Check playlist download progress
-curl "http://localhost:8000/playlist-status/12345678?output_dir=./music"
+curl "http://localhost:8000/playlist-status/12345678?output_dir=./music" -H "X-API-Key: your_generated_api_key"
+
+# Clear the metadata cache
+curl -X POST "http://localhost:8000/cache/clear" -H "X-API-Key: your_generated_api_key"
 
 # Export downloaded album as ZIP
 curl "http://localhost:8000/export-album/em5pzj2fxalfl?output_dir=./music" \
+  -H "X-API-Key: your_generated_api_key" \
   --output "Francesco Cavestri - Noè.zip"
 ```
