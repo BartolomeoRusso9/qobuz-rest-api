@@ -55,7 +55,7 @@ Interactive docs available at **<http://localhost:8000/docs>**
 A pre-built image is published automatically to the GitHub Container Registry on every push to `main`.
 
 ```
-docker pull ghcr.io/bartolomeorusso9/qobuz-api:main
+docker pull ghcr.io/bartolomeorusso9/qobuz-rest-api:main
 ```
 
 Run with your token:
